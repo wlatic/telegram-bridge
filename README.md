@@ -4,7 +4,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Bash](https://img.shields.io/badge/bash-4%2B-orange)
 
-**Telegram ↔ tmux bridge for Claude Code**
+**Telegram <-> tmux bridge for Claude Code**
 
 Control multiple Claude Code sessions from your phone via Telegram Forum Topics. One topic per session, fully bidirectional.
 
@@ -13,7 +13,10 @@ Control multiple Claude Code sessions from your phone via Telegram Forum Topics.
 - **One bot, multiple sessions** — each tmux session gets its own Forum Topic in a Telegram group
 - **Bidirectional** — messages from Telegram inject into sessions, Claude's responses stream back via JSONL transcript monitoring
 - **Works regardless of input source** — type in terminal or Telegram, output always appears in both places
-- **"Working..." indicator** — progress dots while Claude thinks or runs tools, "✓ Done" when idle
+- **"Working..." indicator** — progress dots while Claude thinks or runs tools, "Done" when idle
+- **Agent detection** — shows agent names in Working indicator when sub-agents are running
+- **Claude Code hooks integration** — reliable status detection via lifecycle hooks (PreToolUse, Stop, SubagentStart, SubagentStop)
+- **Permission prompt detection** — notifies you when Claude is waiting for approval
 - **Preview + expandable blockquote** — first 200 chars visible for long responses, tap to expand
 - **Session lifecycle** — auto-creates topics for new sessions, deletes when sessions end, renames when an external renamer (e.g. janitor) renames the tmux session
 - **Resume conversations** — browse and resume old conversations from Telegram
@@ -21,6 +24,8 @@ Control multiple Claude Code sessions from your phone via Telegram Forum Topics.
 - **Voice messages** — transcribed via Whisper (Groq or OpenAI) and injected into the session as text
 - **Terminal screenshots** — `/screenshot` captures the tmux pane and sends it as a code block
 - **Permission approvals** — `/approval yes|no` for tool permission prompts without switching to a terminal
+- **Task notifications** — displays task notification entries from the JSONL stream
+- **Queued message indicator** — shows when your message is queued because Claude is busy
 - **Pure bash + curl + jq** — no Python, no Node, no external dependencies beyond standard CLI tools
 
 ## Commands
@@ -28,8 +33,12 @@ Control multiple Claude Code sessions from your phone via Telegram Forum Topics.
 | Command | Description |
 |---|---|
 | `/sessions` | List active Claude Code sessions |
+| `/status` | Session status with uptime (works from any topic or General) |
 | `/new [danger\|normal]` | Launch a new session (default: normal) |
 | `/resume` | Browse and resume old conversations |
+| `/cancel` | Send Escape to interrupt Claude in the current session |
+| `/close` | Close the session in this topic (kills tmux session, deletes topic) |
+| `/restart` | Kill and resume the same conversation |
 | `/kill N` | Kill session N (requires `ENABLE_KILL=true`) |
 | `/approval [yes\|no]` | Approve/deny a pending permission prompt |
 | `/screenshot` | Capture and send current terminal screen |
@@ -44,17 +53,42 @@ Three layers handle the bridge between Telegram and your Claude Code sessions:
 
 1. **Telegram Bot API polling** — long-polls `getUpdates` every 2 seconds, routes incoming messages to the right session by Forum Topic ID
 2. **JSONL transcript monitoring** — one background watcher per session tails the Claude Code conversation JSONL file using byte-offset tracking, extracts new assistant and user messages, and forwards them to Telegram
-3. **tmux integration** — `send-keys` injects text into sessions, session list detection creates/deletes/renames topics as sessions come and go, PID tracking distinguishes renames from new sessions
+3. **tmux integration** — `send-keys` injects text into sessions (always targeting pane `:1.1`), session list detection creates/deletes/renames topics as sessions come and go, PID tracking distinguishes renames from new sessions
+4. **Claude Code hooks** (optional) — a hook script writes status files on lifecycle events, giving the bridge reliable real-time knowledge of what Claude is doing without needing to scrape the tmux pane
 
 ```
 Phone (Telegram)
-    ↕ Bot API (HTTPS polling)
+    | Bot API (HTTPS polling)
 telegram-bridge (bash, runs in tmux)
-    ↕ JSONL watchers + tmux send-keys
+    | JSONL watchers + tmux send-keys
 Claude Code sessions (separate tmux sessions)
+    |
+    +-- telegram-bridge-hook (writes status files on lifecycle events)
 ```
 
 The bridge runs as its own tmux session. It self-launches: calling `telegram-bridge` when it's already running is a no-op.
+
+## Status Indicators
+
+The bridge shows real-time status in each session's Forum Topic:
+
+| Indicator | Meaning |
+|---|---|
+| **Working...** | Claude is processing (dots animate every 30s) |
+| **Working... (@agent-name)** | A sub-agent is running, with its name shown |
+| **Done** | Claude has finished and is waiting for input |
+| **Permission needed** | Claude is waiting for a tool approval |
+| **Queued** | Your message was received but Claude is busy; it will be sent when ready |
+
+Status detection uses two methods (hooks preferred, pane scraping as fallback):
+
+### Hooks vs Pane Scraping
+
+**Hooks (preferred):** When `telegram-bridge-hook` is configured as a Claude Code hook, it writes JSON status files on every lifecycle event (tool use, stop, agent start/stop). The bridge reads these files for instant, reliable status updates with no false positives.
+
+**Pane scraping (fallback):** If hooks are not configured, the bridge falls back to checking the tmux pane content for the `>` prompt, `@agent` indicators, and permission prompts. This works but is less reliable — it can occasionally misdetect status during rapid output.
+
+The bridge automatically uses whichever method is available. Hooks take priority when status files exist and are recent.
 
 ## Setup
 
@@ -69,7 +103,7 @@ The bridge runs as its own tmux session. It self-launches: calling `telegram-bri
 1. Create a new Telegram group
 2. Go to group settings and enable **Topics** (this turns it into a Forum group)
 3. Add your bot to the group as an **admin** with at least the **Manage Topics** permission
-4. **Disable Group Privacy**: in BotFather, go to your bot → Bot Settings → Group Privacy → Turn **OFF**. The bot needs to read all messages in topics, not just commands.
+4. **Disable Group Privacy**: in BotFather, go to your bot -> Bot Settings -> Group Privacy -> Turn **OFF**. The bot needs to read all messages in topics, not just commands.
 
 ### 3. Get the group chat ID
 
@@ -101,17 +135,65 @@ Edit `~/.config/telegram-bridge/.env` and fill in:
 
 ```bash
 cp telegram-bridge ~/bin/
-# or anywhere in your PATH
-chmod +x ~/bin/telegram-bridge
+cp telegram-bridge-hook ~/bin/
+chmod +x ~/bin/telegram-bridge ~/bin/telegram-bridge-hook
 ```
 
-### 7. Run
+### 7. Configure Claude Code Hooks (recommended)
+
+The hook script gives the bridge reliable status detection. Add the following to your Claude Code `settings.json` (at `~/.claude/settings.json` or your project's `.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "type": "command",
+        "command": "telegram-bridge-hook"
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "telegram-bridge-hook"
+      }
+    ],
+    "SubagentStart": [
+      {
+        "type": "command",
+        "command": "telegram-bridge-hook"
+      }
+    ],
+    "SubagentStop": [
+      {
+        "type": "command",
+        "command": "telegram-bridge-hook"
+      }
+    ]
+  }
+}
+```
+
+The hook script receives JSON on stdin from Claude Code and writes a status file to `~/.config/telegram-bridge/hook_status_<session_id>.json`. It is designed to be fast (just writes a file and exits) so it does not slow down Claude Code.
+
+### 8. Run
 
 ```bash
 telegram-bridge
 ```
 
 This launches a background tmux session called `telegram-bridge`. It will auto-detect existing Claude Code sessions and create Forum Topics for them.
+
+## Files
+
+| File | Description |
+|---|---|
+| `telegram-bridge` | Main bridge script (~1700 lines bash) |
+| `telegram-bridge-hook` | Claude Code hook script — writes status files for reliable detection |
+| `.env.example` | Example configuration file |
+| `LICENSE` | MIT license |
+| `README.md` | This file |
+| `CHANGELOG.md` | Version history |
 
 ## Configuration
 
@@ -143,6 +225,7 @@ The bridge stores state in `~/.config/telegram-bridge/`:
 - `offsets/` — byte offsets for JSONL file watchers (survive restarts)
 - `watchers/` — PID files for background watcher processes
 - `last_sent/` — echo suppression (tracks last message sent via Telegram per session)
+- `hook_status_*.json` — status files written by `telegram-bridge-hook` (one per session)
 
 ## Integration
 

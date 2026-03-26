@@ -776,6 +776,213 @@ cmd_close() {
     log "Closed session '$session_name' via /close"
 }
 
+cmd_status() {
+    local topic_id="$1"
+    log "Command: /status"
+
+    # Helper: format session status line
+    _session_status_line() {
+        local sess="$1"
+        local working_file="${CONFIG_DIR}/working_${sess}"
+        local activity_file="${CONFIG_DIR}/activity_${sess}"
+        local agent_status_file="${CONFIG_DIR}/agent_status_${sess}"
+        local status=""
+
+        if [[ -f "$working_file" ]]; then
+            status="Working..."
+            if [[ -f "$agent_status_file" ]]; then
+                local agent_info
+                agent_info=$(cat "$agent_status_file" 2>/dev/null) || true
+                # Extract agent name from status like "Working.... (@foo)"
+                if [[ "$agent_info" =~ \(@([a-zA-Z0-9_-]+)\) ]]; then
+                    status="Working... (@${BASH_REMATCH[1]})"
+                fi
+            fi
+        elif [[ -f "$activity_file" ]]; then
+            local last_act now_s ago
+            last_act=$(cat "$activity_file" 2>/dev/null) || last_act=0
+            now_s=$(date +%s)
+            ago=$(( now_s - last_act ))
+            if (( ago < 60 )); then
+                status="Idle (${ago}s ago)"
+            elif (( ago < 3600 )); then
+                status="Idle ($(( ago / 60 ))m ago)"
+            else
+                status="Idle ($(( ago / 3600 ))h ago)"
+            fi
+        else
+            status="Idle"
+        fi
+        echo "$status"
+    }
+
+    # If used in a session topic, show that session's status
+    if (( topic_id > 0 )); then
+        local session_name
+        session_name=$(get_session_for_topic "$topic_id")
+        if [[ -n "$session_name" ]]; then
+            if ! tmux has-session -t "$session_name" 2>/dev/null; then
+                send_message "$topic_id" "<i>Session ended.</i>"
+                mark_topic_inactive "$session_name"
+                return
+            fi
+
+            local status
+            status=$(_session_status_line "$session_name")
+            local escaped_status
+            escaped_status=$(escape_html "$status")
+
+            # Get uptime
+            local created_ts uptime_str=""
+            created_ts=$(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null \
+                | awk -v s="$session_name" '$1 == s {print $2}') || true
+            if [[ -n "$created_ts" ]]; then
+                local now_s=$( date +%s )
+                local up=$(( now_s - created_ts ))
+                local hours=$(( up / 3600 ))
+                local mins=$(( (up % 3600) / 60 ))
+                uptime_str="${hours}h ${mins}m"
+            fi
+
+            local escaped_sess
+            escaped_sess=$(escape_html "$session_name")
+            local msg="<b>Session:</b> ${escaped_sess}
+<b>Status:</b> ${escaped_status}
+<b>Uptime:</b> ${uptime_str:-unknown}"
+            send_message "$topic_id" "$msg"
+            return
+        fi
+    fi
+
+    # General or unmapped topic: show ALL active sessions
+    local output=""
+    local count=0
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local name
+        name=$(echo "$line" | cut -d'|' -f1)
+        local status
+        status=$(_session_status_line "$name")
+        local escaped_name escaped_status
+        escaped_name=$(escape_html "$name")
+        escaped_status=$(escape_html "$status")
+        output+="<code>${escaped_name}</code> — ${escaped_status}\n"
+        (( count++ )) || true
+    done < <(get_claude_sessions)
+
+    if (( count == 0 )); then
+        output="<i>No active sessions</i>"
+    fi
+
+    if (( topic_id > 0 )); then
+        send_message "$topic_id" "$output"
+    else
+        send_general_message "$output"
+    fi
+}
+
+cmd_cancel() {
+    local topic_id="$1"
+    log "Command: /cancel"
+
+    if (( topic_id == 0 )); then
+        send_general_message "<i>/cancel must be used in a session topic</i>"
+        return
+    fi
+
+    local session_name
+    session_name=$(get_session_for_topic "$topic_id")
+    if [[ -z "$session_name" ]]; then
+        send_message "$topic_id" "<i>No session mapped to this topic</i>"
+        return
+    fi
+
+    if ! tmux has-session -t "$session_name" 2>/dev/null; then
+        send_message "$topic_id" "<i>Session ended.</i>"
+        mark_topic_inactive "$session_name"
+        return
+    fi
+
+    tmux send-keys -t "${session_name}:1.1" Escape
+    send_message "$topic_id" "⚡ Interrupted"
+
+    # Clean up working indicator
+    local working_file="${CONFIG_DIR}/working_${session_name}"
+    if [[ -f "$working_file" ]]; then
+        local w_id
+        w_id=$(cat "$working_file" 2>/dev/null) || true
+        if [[ -n "$w_id" ]]; then
+            edit_message "$w_id" "⚡ Cancelled" "" >/dev/null 2>&1 || true
+        fi
+        rm -f "$working_file" "${CONFIG_DIR}/activity_${session_name}" "${CONFIG_DIR}/agent_status_${session_name}" "${CONFIG_DIR}/working_dots_${session_name}"
+    fi
+}
+
+cmd_restart() {
+    local topic_id="$1"
+    log "Command: /restart"
+
+    if (( topic_id == 0 )); then
+        send_general_message "<i>/restart must be used in a session topic</i>"
+        return
+    fi
+
+    local session_name
+    session_name=$(get_session_for_topic "$topic_id")
+    if [[ -z "$session_name" ]]; then
+        send_message "$topic_id" "<i>No session mapped to this topic</i>"
+        return
+    fi
+
+    # Get conversation ID before killing
+    local conv_id=""
+    # Try state.json first
+    conv_id=$(jq -r --arg s "$session_name" '.topics[$s].conv_id // empty' "$STATE_FILE" 2>/dev/null) || true
+    # Fallback to live detection
+    if [[ -z "$conv_id" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
+        conv_id=$(get_conv_id_for_session "$session_name") || true
+    fi
+
+    if [[ -z "$conv_id" ]]; then
+        send_message "$topic_id" "<i>Cannot restart — no conversation ID found. Use /close and /new instead.</i>"
+        return
+    fi
+
+    send_message "$topic_id" "Restarting session..."
+
+    # Stop watcher
+    stop_watcher "$session_name"
+
+    # Kill the tmux session
+    tmux kill-session -t "$session_name" 2>/dev/null || true
+
+    # Clean up working state
+    rm -f "${CONFIG_DIR}/working_${session_name}" "${CONFIG_DIR}/activity_${session_name}" \
+          "${CONFIG_DIR}/agent_status_${session_name}" "${CONFIG_DIR}/working_dots_${session_name}" \
+          "${CONFIG_DIR}/permission_notified_${session_name}"
+
+    # Create new tmux session with the same name
+    tmux new-session -d -s "$session_name" -c "$PROJECT_DIR"
+    tmux send-keys -t "${session_name}:1.1" "cd ${PROJECT_DIR} && claude --dangerously-skip-permissions --resume ${conv_id}" Enter
+
+    # Get new pane PID
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$session_name" -F '#{pane_pid}' 2>/dev/null | head -1) || true
+
+    # Update state with new pane PID
+    local tmp="${STATE_FILE}.tmp"
+    jq --arg s "$session_name" --arg pid "${pane_pid:-0}" --arg cid "$conv_id" \
+        '.topics[$s].pane_pid = $pid | .topics[$s].conv_id = $cid' \
+        "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+
+    # Start a new watcher
+    start_watcher "$session_name" "$topic_id"
+
+    send_message "$topic_id" "🔄 Restarted session with same conversation"
+    log "Restarted session '$session_name' with conv_id=$conv_id"
+}
+
 cmd_help() {
     local topic_id="$1"
     local text="<b>Telegram Bridge Commands</b>
@@ -783,6 +990,9 @@ cmd_help() {
 /sessions — List active Claude tmux sessions
 /new [danger|normal] — Launch a new Claude session (default: normal)
 /resume — List recent conversations to resume
+/status — Show session status (or all sessions from General)
+/cancel — Interrupt Claude in this session
+/restart — Kill and resume the same conversation
 /close — Close the session in this topic
 /approval [yes|no] — Approve or deny a pending permission prompt
 /screenshot — Capture and send the current terminal screen
@@ -881,77 +1091,158 @@ start_watcher() {
             stored_offset=$(cat "$offset_file" 2>/dev/null) || stored_offset=0
             stored_offset="${stored_offset:-0}"
 
-            # Nothing new — check if Working... should be cleared (idle 10s)
+            # Nothing new — check if Working... should be cleared (idle)
             if (( current_size <= stored_offset )); then
                 # No new JSONL data — check if Claude is waiting for input
                 local working_file="${CONFIG_DIR}/working_${session_name}"
                 if [[ -f "$working_file" ]]; then
-                    # Check if the tmux pane shows the input prompt (❯)
-                    local pane_content
-                    pane_content=$(tmux capture-pane -t "${session_name}:1.1" -p 2>/dev/null | grep -v '^\s*$' | tail -10) || true
-                    local has_prompt=false
-                    local has_agents=false
-                    echo "$pane_content" | grep -q '❯' && has_prompt=true
-                    # Check for active teammates (@ indicator in status bar)
-                    echo "$pane_content" | grep -q ' @' && has_agents=true
-
                     local w_id
                     w_id=$(cat "$working_file" 2>/dev/null) || true
 
-                    if [[ "$has_prompt" == "true" && "$has_agents" == "false" ]]; then
-                        # Prompt visible, no agents — but wait for cooldown
-                        # Don't fire Done within 15s of last JSONL activity
-                        local activity_file="${CONFIG_DIR}/activity_${session_name}"
-                        local last_activity=0
-                        [[ -f "$activity_file" ]] && last_activity=$(cat "$activity_file" 2>/dev/null) || true
-                        local now_cool
-                        now_cool=$(date +%s)
-                        if (( now_cool - last_activity < 15 )); then
-                            # Too soon — Claude might still be working
-                            continue
+                    # ── Hook-based status detection (preferred) ──
+                    local hook_status_file="${CONFIG_DIR}/hook_status_${conv_id}.json"
+                    local used_hook=false
+
+                    if [[ -f "$hook_status_file" ]]; then
+                        local hook_state hook_ts hook_tool hook_agent
+                        hook_state=$(jq -r '.state // empty' "$hook_status_file" 2>/dev/null) || true
+                        hook_ts=$(jq -r '.timestamp // 0' "$hook_status_file" 2>/dev/null) || true
+
+                        if [[ -n "$hook_state" ]]; then
+                            used_hook=true
+                            # Update activity timestamp from hook
+                            local activity_file="${CONFIG_DIR}/activity_${session_name}"
+                            echo "$hook_ts" > "$activity_file"
+
+                            case "$hook_state" in
+                                idle)
+                                    # Stop hook fired — Claude is done
+                                    # Still apply cooldown to avoid race with final JSONL writes
+                                    local now_cool
+                                    now_cool=$(date +%s)
+                                    if (( now_cool - hook_ts < 5 )); then
+                                        continue
+                                    fi
+                                    if [[ -n "$w_id" ]]; then
+                                        edit_message "$w_id" "✓ Done" "" >/dev/null 2>&1 || true
+                                    fi
+                                    rm -f "$working_file" "${CONFIG_DIR}/activity_${session_name}" "${CONFIG_DIR}/agent_status_${session_name}" "${CONFIG_DIR}/working_dots_${session_name}" "$hook_status_file"
+                                    ;;
+                                tool_use)
+                                    # Claude is using a tool — show which one
+                                    hook_tool=$(jq -r '.tool // "unknown"' "$hook_status_file" 2>/dev/null) || hook_tool="unknown"
+                                    local status_text="Working... (${hook_tool})"
+                                    local prev_status_file="${CONFIG_DIR}/agent_status_${session_name}"
+                                    local prev_status
+                                    prev_status=$(cat "$prev_status_file" 2>/dev/null) || true
+                                    if [[ "$status_text" != "$prev_status" && -n "$w_id" ]]; then
+                                        edit_message "$w_id" "$status_text" "" >/dev/null 2>&1 || true
+                                        echo "$status_text" > "$prev_status_file"
+                                    fi
+                                    ;;
+                                agent_running)
+                                    # Agent spawned — show agent name
+                                    hook_agent=$(jq -r '.agent // "agent"' "$hook_status_file" 2>/dev/null) || hook_agent="agent"
+                                    local status_text="Working... (@${hook_agent})"
+                                    local prev_status_file="${CONFIG_DIR}/agent_status_${session_name}"
+                                    local prev_status
+                                    prev_status=$(cat "$prev_status_file" 2>/dev/null) || true
+                                    if [[ "$status_text" != "$prev_status" && -n "$w_id" ]]; then
+                                        edit_message "$w_id" "$status_text" "" >/dev/null 2>&1 || true
+                                        echo "$status_text" > "$prev_status_file"
+                                    fi
+                                    ;;
+                                agent_done)
+                                    # Agent finished but orchestrator may continue — keep working
+                                    hook_agent=$(jq -r '.agent // "agent"' "$hook_status_file" 2>/dev/null) || hook_agent="agent"
+                                    local status_text="Working... (@${hook_agent} done)"
+                                    local prev_status_file="${CONFIG_DIR}/agent_status_${session_name}"
+                                    local prev_status
+                                    prev_status=$(cat "$prev_status_file" 2>/dev/null) || true
+                                    if [[ "$status_text" != "$prev_status" && -n "$w_id" ]]; then
+                                        edit_message "$w_id" "$status_text" "" >/dev/null 2>&1 || true
+                                        echo "$status_text" > "$prev_status_file"
+                                    fi
+                                    ;;
+                                *)
+                                    # active, notification, etc. — keep Working alive
+                                    ;;
+                            esac
                         fi
+                    fi
 
-                        # Claude is waiting for input with no agents — it's done
-                        if [[ -n "$w_id" ]]; then
-                            edit_message "$w_id" "✓ Done" "" >/dev/null 2>&1 || true
-                        fi
-                        rm -f "$working_file" "${CONFIG_DIR}/activity_${session_name}" "${CONFIG_DIR}/agent_status_${session_name}" "${CONFIG_DIR}/working_dots_${session_name}"
-                    elif [[ -n "$w_id" ]]; then
-                        # Still working — update status with dots and/or agent name
-                        local dots_file="${CONFIG_DIR}/working_dots_${session_name}"
-                        local dot_count
-                        dot_count=$(cat "$dots_file" 2>/dev/null) || dot_count=0
-                        local now_sec
-                        now_sec=$(date +%s)
-                        local last_dot_time
-                        last_dot_time=$(stat -c %Y "$dots_file" 2>/dev/null) || last_dot_time=0
+                    # ── Fallback: pane-scraping (no hook status file) ──
+                    if [[ "$used_hook" == "false" ]]; then
+                        local pane_content
+                        pane_content=$(tmux capture-pane -t "${session_name}:1.1" -p 2>/dev/null | grep -v '^\s*$' | tail -10) || true
+                        local has_prompt=false
+                        local has_agents=false
+                        echo "$pane_content" | grep -q '❯' && has_prompt=true
+                        echo "$pane_content" | grep -q ' @' && has_agents=true
 
-                        # Add a dot every 30 seconds
-                        if (( now_sec - last_dot_time >= 30 )); then
-                            (( dot_count++ )) || true
-                            echo "$dot_count" > "$dots_file"
-                        fi
-
-                        local dot_str=""
-                        for (( d=0; d<dot_count; d++ )); do dot_str+="."; done
-
-                        local status_text="Working...${dot_str}"
-                        if [[ "$has_agents" == "true" ]]; then
-                            local agent_name
-                            agent_name=$(echo "$pane_content" | grep -o ' @[a-zA-Z0-9_-]*' | head -1 | tr -d ' ') || true
-                            [[ -n "$agent_name" ]] && status_text="Working...${dot_str} (${agent_name})"
-                        fi
-
-                        # Only edit if status changed
-                        local prev_status_file="${CONFIG_DIR}/agent_status_${session_name}"
-                        local prev_status
-                        prev_status=$(cat "$prev_status_file" 2>/dev/null) || true
-                        if [[ "$status_text" != "$prev_status" ]]; then
-                            edit_message "$w_id" "$status_text" "" >/dev/null 2>&1 || true
-                            echo "$status_text" > "$prev_status_file"
+                        if [[ "$has_prompt" == "true" && "$has_agents" == "false" ]]; then
+                            local activity_file="${CONFIG_DIR}/activity_${session_name}"
+                            local last_activity=0
+                            [[ -f "$activity_file" ]] && last_activity=$(cat "$activity_file" 2>/dev/null) || true
+                            local now_cool
+                            now_cool=$(date +%s)
+                            if (( now_cool - last_activity < 15 )); then
+                                continue
+                            fi
+                            if [[ -n "$w_id" ]]; then
+                                edit_message "$w_id" "✓ Done" "" >/dev/null 2>&1 || true
+                            fi
+                            rm -f "$working_file" "${CONFIG_DIR}/activity_${session_name}" "${CONFIG_DIR}/agent_status_${session_name}" "${CONFIG_DIR}/working_dots_${session_name}"
+                        elif [[ -n "$w_id" ]]; then
+                            local dots_file="${CONFIG_DIR}/working_dots_${session_name}"
+                            local dot_count
+                            dot_count=$(cat "$dots_file" 2>/dev/null) || dot_count=0
+                            local now_sec
+                            now_sec=$(date +%s)
+                            local last_dot_time
+                            last_dot_time=$(stat -c %Y "$dots_file" 2>/dev/null) || last_dot_time=0
+                            if (( now_sec - last_dot_time >= 30 )); then
+                                (( dot_count++ )) || true
+                                echo "$dot_count" > "$dots_file"
+                            fi
+                            local dot_str=""
+                            for (( d=0; d<dot_count; d++ )); do dot_str+="."; done
+                            local status_text="Working...${dot_str}"
+                            if [[ "$has_agents" == "true" ]]; then
+                                local agent_name
+                                agent_name=$(echo "$pane_content" | grep -o ' @[a-zA-Z0-9_-]*' | head -1 | tr -d ' ') || true
+                                [[ -n "$agent_name" ]] && status_text="Working...${dot_str} (${agent_name})"
+                            fi
+                            local prev_status_file="${CONFIG_DIR}/agent_status_${session_name}"
+                            local prev_status
+                            prev_status=$(cat "$prev_status_file" 2>/dev/null) || true
+                            if [[ "$status_text" != "$prev_status" ]]; then
+                                edit_message "$w_id" "$status_text" "" >/dev/null 2>&1 || true
+                                echo "$status_text" > "$prev_status_file"
+                            fi
                         fi
                     fi
                 fi
+
+                # Permission prompt detection
+                local permission_notified_file="${CONFIG_DIR}/permission_notified_${session_name}"
+                local perm_pane_content
+                perm_pane_content=$(tmux capture-pane -t "${session_name}:1.1" -p 2>/dev/null | grep -v '^\s*$' | tail -15) || true
+                local has_permission_prompt=false
+                if echo "$perm_pane_content" | grep -qE '(Allow once|Allow always|Always allow|Deny)'; then
+                    has_permission_prompt=true
+                fi
+
+                if [[ "$has_permission_prompt" == "true" ]]; then
+                    if [[ ! -f "$permission_notified_file" ]]; then
+                        send_message "$topic_id" "⚠️ Permission prompt — use /approval yes or /approval no" >/dev/null 2>&1 || true
+                        touch "$permission_notified_file"
+                    fi
+                else
+                    # Prompt gone — clear notification tracking
+                    rm -f "$permission_notified_file"
+                fi
+
                 continue
             fi
 
@@ -977,8 +1268,27 @@ start_watcher() {
                 local activity_file="${CONFIG_DIR}/activity_${session_name}"
                 echo "$(date +%s)" > "$activity_file"
 
-                # Skip queue-operation after tracking activity (teammate work, not displayable)
-                [[ "$msg_type" == "queue-operation" ]] && continue
+                # Show task notifications from queue-operations
+                if [[ "$msg_type" == "queue-operation" ]]; then
+                    local operation
+                    operation=$(echo "$line" | jq -r '.operation // empty' 2>/dev/null) || true
+                    if [[ "$operation" == "enqueue" ]]; then
+                        local q_content
+                        q_content=$(echo "$line" | jq -r '.content // empty' 2>/dev/null) || true
+                        if [[ -n "$q_content" && "$q_content" == *"<task-notification>"* ]]; then
+                            # Extract task summary
+                            local task_status task_summary
+                            task_status=$(echo "$q_content" | grep -oP '(?<=<status>).*(?=</status>)' | head -1) || true
+                            task_summary=$(echo "$q_content" | grep -oP '(?<=<summary>).*(?=</summary>)' | head -1) || true
+                            if [[ -n "$task_summary" ]]; then
+                                local escaped_summary
+                                escaped_summary=$(escape_html "${task_summary:0:200}")
+                                send_message "$topic_id" "📋 Task ${task_status:-update}: ${escaped_summary}" "HTML" >/dev/null 2>&1 || true
+                            fi
+                        fi
+                    fi
+                    continue
+                fi
 
                 if [[ "$msg_type" == "assistant" ]]; then
                     # Extract text content from assistant message
@@ -1065,6 +1375,11 @@ start_watcher() {
 
                     [[ -z "$user_text" ]] && continue
 
+                    # Skip internal Claude messages (agent orchestration, system context)
+                    if [[ "$user_text" == *"<task-notification>"* || "$user_text" == *"<teammate-message>"* || "$user_text" == *"<system-reminder>"* ]]; then
+                        continue
+                    fi
+
                     # Skip if this was sent from Telegram (avoid echo)
                     if [[ -f "$last_sent_file" ]]; then
                         local last_sent
@@ -1092,12 +1407,19 @@ start_watcher() {
                     send_message "$topic_id" "👤 ${escaped_user}" "HTML" >/dev/null 2>&1 || true
 
                     # Send "Working..." so Telegram shows Claude is processing
+                    # Clear any existing Working... first
+                    local working_file="${CONFIG_DIR}/working_${session_name}"
+                    if [[ -f "$working_file" ]]; then
+                        local old_w_id
+                        old_w_id=$(cat "$working_file" 2>/dev/null) || true
+                        [[ -n "$old_w_id" ]] && edit_message "$old_w_id" "✓ Done" "" >/dev/null 2>&1 || true
+                        rm -f "$working_file"
+                    fi
                     local working_response
                     working_response=$(send_message "$topic_id" "Working...")
                     local w_msg_id
                     w_msg_id=$(echo "$working_response" | jq -r '.result.message_id // empty') || true
                     if [[ -n "$w_msg_id" ]]; then
-                        local working_file="${CONFIG_DIR}/working_${session_name}"
                         echo "$w_msg_id" > "$working_file"
                         # Watcher handles dots and agent status — no background process needed
                     fi
@@ -1175,11 +1497,30 @@ route_message() {
     local last_sent_file="${LAST_SENT_DIR}/${session_name}"
     echo "$text" > "$last_sent_file"
 
+    # Check if Claude is busy (no ❯ prompt = busy, message will be queued)
+    local pane_check
+    pane_check=$(tmux capture-pane -t "${session_name}:1.1" -p 2>/dev/null | grep -v '^\s*$' | tail -5) || true
+    local is_idle=false
+    echo "$pane_check" | grep -q '❯' && is_idle=true
+
     # Inject message into tmux session
     tmux send-keys -t "${session_name}:1.1" -- "$text" Enter
 
     # Send delivery confirmation
-    send_message "$topic_id" "Message sent ✓" >/dev/null 2>&1 || true
+    if [[ "$is_idle" == "true" ]]; then
+        send_message "$topic_id" "Message sent ✓" >/dev/null 2>&1 || true
+    else
+        send_message "$topic_id" "📨 Message queued (Claude is busy)" >/dev/null 2>&1 || true
+    fi
+
+    # Clear any existing Working... before creating new one
+    local working_file="${CONFIG_DIR}/working_${session_name}"
+    if [[ -f "$working_file" ]]; then
+        local old_w_id
+        old_w_id=$(cat "$working_file" 2>/dev/null) || true
+        [[ -n "$old_w_id" ]] && edit_message "$old_w_id" "✓ Done" "" >/dev/null 2>&1 || true
+        rm -f "$working_file"
+    fi
 
     # Send "Working..." message and store its ID for the watcher to edit
     local response
@@ -1188,7 +1529,6 @@ route_message() {
     working_msg_id=$(echo "$response" | jq -r '.result.message_id // empty') || true
 
     if [[ -n "$working_msg_id" ]]; then
-        local working_file="${CONFIG_DIR}/working_${session_name}"
         echo "$working_msg_id" > "$working_file"
         # Watcher handles dots and agent status — no background process needed
     fi
@@ -1655,6 +1995,15 @@ main_loop() {
                         answer=$(echo "$answer" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
                     fi
                     cmd_approval "$topic_id" "$answer"
+                    ;;
+                /status|/status@*)
+                    cmd_status "$topic_id"
+                    ;;
+                /cancel|/cancel@*)
+                    cmd_cancel "$topic_id"
+                    ;;
+                /restart|/restart@*)
+                    cmd_restart "$topic_id"
                     ;;
                 /close|/close@*)
                     cmd_close "$topic_id"

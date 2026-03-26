@@ -1,0 +1,51 @@
+#!/bin/bash
+# telegram-bridge-hook — writes status for the telegram-bridge
+# Called by Claude Code hooks on lifecycle events.
+# Must be FAST — Claude Code waits for it. Just write a file and exit.
+
+STATUS_DIR="${HOME}/.config/telegram-bridge"
+mkdir -p "$STATUS_DIR"
+
+# Read hook payload from stdin
+PAYLOAD=$(cat)
+HOOK_TYPE=$(echo "$PAYLOAD" | jq -r '.hook_type // .event // empty' 2>/dev/null)
+SESSION_ID=$(echo "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)
+
+# If no session_id, try alternate field names
+if [[ -z "$SESSION_ID" ]]; then
+    SESSION_ID=$(echo "$PAYLOAD" | jq -r '.sessionId // .session // empty' 2>/dev/null)
+fi
+
+[[ -z "$SESSION_ID" || -z "$HOOK_TYPE" ]] && exit 0
+
+STATUS_FILE="${STATUS_DIR}/hook_status_${SESSION_ID}.json"
+
+case "$HOOK_TYPE" in
+    PreToolUse|pre_tool_use)
+        TOOL=$(echo "$PAYLOAD" | jq -r '.tool_name // .tool // "unknown"' 2>/dev/null)
+        jq -n --arg state "tool_use" --arg tool "$TOOL" --argjson ts "$(date +%s)" \
+            '{state: $state, tool: $tool, timestamp: $ts}' > "$STATUS_FILE"
+        ;;
+    Stop|stop)
+        jq -n --arg state "idle" --argjson ts "$(date +%s)" \
+            '{state: $state, timestamp: $ts}' > "$STATUS_FILE"
+        ;;
+    SubagentStart|subagent_start)
+        AGENT=$(echo "$PAYLOAD" | jq -r '.agent_name // .agent // "agent"' 2>/dev/null)
+        jq -n --arg state "agent_running" --arg agent "$AGENT" --argjson ts "$(date +%s)" \
+            '{state: $state, agent: $agent, timestamp: $ts}' > "$STATUS_FILE"
+        ;;
+    SubagentStop|subagent_stop)
+        AGENT=$(echo "$PAYLOAD" | jq -r '.agent_name // .agent // "agent"' 2>/dev/null)
+        jq -n --arg state "agent_done" --arg agent "$AGENT" --argjson ts "$(date +%s)" \
+            '{state: $state, agent: $agent, timestamp: $ts}' > "$STATUS_FILE"
+        ;;
+    Notification|notification)
+        jq -n --arg state "notification" --argjson ts "$(date +%s)" \
+            '{state: $state, timestamp: $ts}' > "$STATUS_FILE"
+        ;;
+    *)
+        jq -n --arg state "active" --arg event "$HOOK_TYPE" --argjson ts "$(date +%s)" \
+            '{state: $state, event: $event, timestamp: $ts}' > "$STATUS_FILE"
+        ;;
+esac
