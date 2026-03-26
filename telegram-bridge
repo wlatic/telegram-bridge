@@ -1,0 +1,1631 @@
+#!/bin/bash
+# telegram-bridge — Bridges Telegram Forum Topics to tmux Claude Code sessions
+# Runs as a background tmux session, polling Telegram for messages and routing
+# them to/from Claude Code sessions via tmux send-keys + capture-pane.
+#
+# Usage: telegram-bridge          (launches in background tmux session)
+#        telegram-bridge --loop   (runs the main loop directly — used internally)
+#
+# Config: ~/.config/telegram-bridge/.env
+# State:  ~/.config/telegram-bridge/state.json
+
+set -uo pipefail
+# Note: NOT using set -e — the main loop must be resilient to individual
+# command failures (API errors, jq parse failures, missing sessions, etc.)
+
+# ── Config ────────────────────────────────────────────────────────────
+
+CONFIG_DIR="${HOME}/.config/telegram-bridge"
+ENV_FILE="${CONFIG_DIR}/.env"
+STATE_FILE="${CONFIG_DIR}/state.json"
+LOG_DIR="${HOME}/.config/telegram-bridge/logs"
+LOG_FILE="${LOG_DIR}/telegram-bridge.log"
+PROJECT_DIR="${TELEGRAM_BRIDGE_PROJECT_DIR:-${HOME}}"
+
+SKIP_SESSIONS="janitor|telegram-bridge|monitor|dev|admin|brain"
+POLL_INTERVAL=2
+SESSION_CHECK_INTERVAL=10
+
+# Topic icon colors
+COLOR_GREEN=9367192    # normal sessions
+COLOR_RED=16478047     # danger sessions
+COLOR_BLUE=7322096     # resumed sessions
+
+# ── Self-launch pattern (same as janitor) ─────────────────────────────
+
+if [[ "${1:-}" == "--loop" ]]; then
+    :
+else
+    if tmux has-session -t telegram-bridge 2>/dev/null; then
+        echo "Telegram bridge already running"
+        exit 0
+    fi
+    tmux new-session -d -s telegram-bridge "$(readlink -f "$0") --loop"
+    echo "Telegram bridge session started"
+    exit 0
+fi
+
+# ── Load config ───────────────────────────────────────────────────────
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "Error: Config file not found at $ENV_FILE"
+    echo "Create it with TELEGRAM_BOT_TOKEN, TELEGRAM_GROUP_ID, TELEGRAM_ALLOWED_USER"
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$ENV_FILE"
+
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:?Missing TELEGRAM_BOT_TOKEN in .env}"
+GROUP_ID="${TELEGRAM_GROUP_ID:?Missing TELEGRAM_GROUP_ID in .env}"
+ALLOWED_USER="${TELEGRAM_ALLOWED_USER:?Missing TELEGRAM_ALLOWED_USER in .env}"
+ENABLE_KILL="${ENABLE_KILL:-false}"
+GROQ_API_KEY="${GROQ_API_KEY:-}"
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+
+API="https://api.telegram.org/bot${BOT_TOKEN}"
+TMP_DIR="${HOME}/tmp"
+
+OFFSETS_DIR="${CONFIG_DIR}/offsets"
+WATCHERS_DIR="${CONFIG_DIR}/watchers"
+LAST_SENT_DIR="${CONFIG_DIR}/last_sent"
+
+mkdir -p "$LOG_DIR" "$CONFIG_DIR" "$OFFSETS_DIR" "$WATCHERS_DIR" "$LAST_SENT_DIR" "$TMP_DIR"
+
+# ── Logging ───────────────────────────────────────────────────────────
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# ── State management ──────────────────────────────────────────────────
+
+init_state() {
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo '{"offset":0,"topics":{}}' > "$STATE_FILE"
+    fi
+}
+
+get_state() {
+    local key="$1"
+    jq -r "$key" "$STATE_FILE" 2>/dev/null || echo ""
+}
+
+set_state() {
+    local key="$1" value="$2"
+    local tmp="${STATE_FILE}.tmp"
+    jq "$key = $value" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+get_offset() {
+    local off
+    off=$(get_state '.offset')
+    echo "${off:-0}"
+}
+
+set_offset() {
+    set_state '.offset' "$1"
+}
+
+# Map a session name to a topic ID
+set_topic_mapping() {
+    local session="$1" topic_id="$2" pane_pid="${3:-0}" conv_id="${4:-}"
+    local now
+    now=$(date -u '+%Y-%m-%dT%H:%M:%S')
+    local tmp="${STATE_FILE}.tmp"
+    jq --arg s "$session" --argjson t "$topic_id" --arg c "$now" --arg pid "$pane_pid" --arg cid "$conv_id" \
+        '.topics[$s] = {"topic_id": $t, "created": $c, "active": true, "pane_pid": $pid, "conv_id": $cid}' \
+        "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+# Find an inactive topic by conversation ID (for reopening)
+find_inactive_topic_by_conv() {
+    local conv_id="$1"
+    [[ -z "$conv_id" ]] && return
+    jq -r --arg cid "$conv_id" \
+        '.topics | to_entries[] | select(.value.active == false and .value.conv_id == $cid) | "\(.key)|\(.value.topic_id)"' \
+        "$STATE_FILE" 2>/dev/null | head -1
+}
+
+# Reopen a closed topic
+reopen_topic() {
+    local topic_id="$1"
+    local payload
+    payload=$(jq -n --argjson chat "$GROUP_ID" --argjson topic "$topic_id" \
+        '{chat_id: $chat, message_thread_id: $topic}')
+    tg_api "reopenForumTopic" -d "$payload"
+}
+
+# Reactivate a topic mapping under a (possibly new) session name
+reactivate_topic_mapping() {
+    local old_name="$1" new_name="$2" pane_pid="${3:-0}"
+    local tmp="${STATE_FILE}.tmp"
+    if [[ "$old_name" == "$new_name" ]]; then
+        jq --arg s "$new_name" --arg pid "$pane_pid" \
+            '.topics[$s].active = true | .topics[$s].pane_pid = $pid' \
+            "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+    else
+        jq --arg old "$old_name" --arg new "$new_name" --arg pid "$pane_pid" \
+            '.topics[$new] = .topics[$old] | .topics[$new].active = true | .topics[$new].pane_pid = $pid | del(.topics[$old])' \
+            "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+    fi
+}
+
+# Get session name for a topic ID
+get_session_for_topic() {
+    local topic_id="$1"
+    jq -r --argjson t "$topic_id" \
+        '.topics | to_entries[] | select(.value.topic_id == $t and .value.active == true) | .key' \
+        "$STATE_FILE" 2>/dev/null | head -1
+}
+
+# Get topic ID for a session name (active only)
+get_topic_for_session() {
+    local session="$1"
+    jq -r --arg s "$session" 'if .topics[$s].active == true then .topics[$s].topic_id else empty end' "$STATE_FILE" 2>/dev/null
+}
+
+# Mark a topic as inactive
+mark_topic_inactive() {
+    local session="$1"
+    local tmp="${STATE_FILE}.tmp"
+    jq --arg s "$session" '.topics[$s].active = false' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+# Update session name in state (for renames)
+rename_topic_mapping() {
+    local old_name="$1" new_name="$2"
+    local tmp="${STATE_FILE}.tmp"
+    jq --arg old "$old_name" --arg new "$new_name" \
+        '.topics[$new] = .topics[$old] | del(.topics[$old])' \
+        "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+# ── HTML escaping ─────────────────────────────────────────────────────
+
+escape_html() {
+    local text="$1"
+    printf '%s' "$text" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+# ── Telegram API helpers ──────────────────────────────────────────────
+
+tg_api() {
+    local method="$1"
+    shift
+    local response
+    response=$(curl -s -X POST -H "Content-Type: application/json" "$@" "${API}/${method}")
+
+    # Handle rate limiting
+    local ok
+    ok=$(echo "$response" | jq -r '.ok' 2>/dev/null) || true
+    if [[ "$ok" == "false" ]]; then
+        local error_code
+        error_code=$(echo "$response" | jq -r '.error_code' 2>/dev/null) || true
+        if [[ "$error_code" == "429" ]]; then
+            local retry_after
+            retry_after=$(echo "$response" | jq -r '.parameters.retry_after // 5' 2>/dev/null) || true
+            log "Rate limited, sleeping ${retry_after}s"
+            sleep "$retry_after"
+            response=$(curl -s -X POST -H "Content-Type: application/json" "$@" "${API}/${method}")
+        else
+            log "API error: $response"
+        fi
+    fi
+
+    echo "$response"
+}
+
+send_message() {
+    local topic_id="$1" text="$2" parse_mode="${3:-HTML}"
+    local payload
+    if [[ -n "$parse_mode" ]]; then
+        payload=$(jq -n --argjson chat "$GROUP_ID" --argjson topic "$topic_id" \
+            --arg text "$text" --arg mode "$parse_mode" \
+            '{chat_id: $chat, message_thread_id: $topic, text: $text, parse_mode: $mode}')
+    else
+        payload=$(jq -n --argjson chat "$GROUP_ID" --argjson topic "$topic_id" \
+            --arg text "$text" \
+            '{chat_id: $chat, message_thread_id: $topic, text: $text}')
+    fi
+    tg_api "sendMessage" -d "$payload"
+}
+
+# Send message to general topic (topic_id not specified or 0)
+send_general_message() {
+    local text="$1" parse_mode="${2:-HTML}"
+    local payload
+    payload=$(jq -n --argjson chat "$GROUP_ID" \
+        --arg text "$text" --arg mode "$parse_mode" \
+        '{chat_id: $chat, text: $text, parse_mode: $mode}')
+    tg_api "sendMessage" -d "$payload"
+}
+
+edit_message() {
+    local message_id="$1" text="$2" parse_mode="${3:-HTML}"
+    local payload
+    payload=$(jq -n --argjson chat "$GROUP_ID" --argjson msg "$message_id" \
+        --arg text "$text" --arg mode "$parse_mode" \
+        '{chat_id: $chat, message_id: $msg, text: $text, parse_mode: $mode}')
+    tg_api "editMessageText" -d "$payload"
+}
+
+create_topic() {
+    local name="$1" color="${2:-$COLOR_GREEN}"
+    local payload
+    payload=$(jq -n --argjson chat "$GROUP_ID" --arg name "$name" --argjson color "$color" \
+        '{chat_id: $chat, name: $name, icon_color: $color}')
+    tg_api "createForumTopic" -d "$payload"
+}
+
+close_topic() {
+    local topic_id="$1"
+    local payload
+    payload=$(jq -n --argjson chat "$GROUP_ID" --argjson topic "$topic_id" \
+        '{chat_id: $chat, message_thread_id: $topic}')
+    tg_api "closeForumTopic" -d "$payload"
+}
+
+delete_topic() {
+    local topic_id="$1"
+    local payload
+    payload=$(jq -n --argjson chat "$GROUP_ID" --argjson topic "$topic_id" \
+        '{chat_id: $chat, message_thread_id: $topic}')
+    tg_api "deleteForumTopic" -d "$payload"
+}
+
+edit_topic_name() {
+    local topic_id="$1" name="$2"
+    local payload
+    payload=$(jq -n --argjson chat "$GROUP_ID" --argjson topic "$topic_id" --arg name "$name" \
+        '{chat_id: $chat, message_thread_id: $topic, name: $name}')
+    tg_api "editForumTopic" -d "$payload"
+}
+
+# ── Session helpers (adapted from ai/janitor) ─────────────────────────
+
+CONV_DIR="${TELEGRAM_BRIDGE_CONV_DIR:-${HOME}/.claude/projects}"
+
+# Get conversation ID from a claude process
+get_conv_id_for_session() {
+    local sess="$1"
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1) || true
+    [[ -z "$pane_pid" ]] && return 0
+
+    local claude_pid
+    claude_pid=$(ps --ppid "$pane_pid" -o pid= 2>/dev/null | head -1 | tr -d ' ') || true
+    [[ -z "$claude_pid" ]] && return 0
+
+    # Try --resume in cmdline
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "/proc/${claude_pid}/cmdline" 2>/dev/null) || true
+    if [[ "$cmdline" =~ --resume[[:space:]]+([a-f0-9-]+) ]]; then
+        local cid="${BASH_REMATCH[1]}"
+        if [[ -f "${CONV_DIR}/${cid}.jsonl" ]]; then
+            echo "$cid"
+            return 0
+        fi
+    fi
+
+    # Fallback: session file
+    local sf="${HOME}/.claude/sessions/${claude_pid}.json"
+    [[ -f "$sf" ]] || return 0
+    local sid
+    sid=$(python3 -c "import json; print(json.load(open('${sf}'))['sessionId'])" 2>/dev/null) || true
+    if [[ -n "$sid" && -f "${CONV_DIR}/${sid}.jsonl" ]]; then
+        echo "$sid"
+    fi
+}
+
+is_skipped() {
+    local name="$1"
+    [[ "$name" =~ ^(${SKIP_SESSIONS})$ ]]
+}
+
+# Get active Claude sessions: name|pane_pid
+get_claude_sessions() {
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local name
+        name=$(echo "$line" | awk '{print $1}')
+        is_skipped "$name" && continue
+
+        local cmd
+        cmd=$(tmux list-panes -t "$name" -F '#{pane_current_command}' 2>/dev/null | head -1) || true
+
+        if [[ "$cmd" == "claude" ]]; then
+            local pane_pid
+            pane_pid=$(tmux list-panes -t "$name" -F '#{pane_pid}' 2>/dev/null | head -1) || true
+            echo "${name}|${pane_pid:-0}"
+        fi
+    done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null || true)
+}
+
+# Auto-generate a session name
+auto_session_name() {
+    local base
+    base="claude-$(date +%m%d)"
+    local name="$base"
+    local i=2
+    while tmux has-session -t "$name" 2>/dev/null; do
+        name="${base}-${i}"
+        (( i++ )) || true
+    done
+    echo "$name"
+}
+
+# ── Command handlers ──────────────────────────────────────────────────
+
+cmd_sessions() {
+    local topic_id="$1"
+    log "Command: /sessions"
+
+    local output="<b>Active Claude Sessions</b>\n\n"
+    local count=0
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        local name
+        name=$(echo "$line" | cut -d'|' -f1)
+        local topic_mapped
+        topic_mapped=$(get_topic_for_session "$name")
+        local topic_info=""
+        if [[ -n "$topic_mapped" ]]; then
+            topic_info=" (topic #${topic_mapped})"
+        fi
+        output+="• <code>${name}</code>${topic_info}\n"
+        (( count++ )) || true
+    done < <(get_claude_sessions)
+
+    if (( count == 0 )); then
+        output+="<i>No active sessions</i>"
+    else
+        output+="\n${count} session(s) running"
+    fi
+
+    if (( topic_id > 0 )); then
+        send_message "$topic_id" "$output"
+    else
+        send_general_message "$output"
+    fi
+}
+
+cmd_new() {
+    local topic_id="$1" mode="${2:-normal}"
+    log "Command: /new $mode"
+
+    local sname
+    sname=$(auto_session_name)
+
+    local claude_cmd="cd ${PROJECT_DIR} && claude"
+    if [[ "$mode" == "danger" ]]; then
+        claude_cmd="cd ${PROJECT_DIR} && claude --dangerously-skip-permissions"
+    fi
+
+    # Create tmux session
+    tmux new-session -d -s "$sname" -c "$PROJECT_DIR"
+    tmux send-keys -t "$sname" "$claude_cmd" Enter
+
+    # Get pane PID for rename tracking
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$sname" -F '#{pane_pid}' 2>/dev/null | head -1) || true
+
+    # Pick color based on mode
+    local color="$COLOR_GREEN"
+    [[ "$mode" == "danger" ]] && color="$COLOR_RED"
+
+    # Create Telegram topic
+    local response
+    response=$(create_topic "$sname" "$color")
+    local new_topic_id
+    new_topic_id=$(echo "$response" | jq -r '.result.message_thread_id // empty') || true
+
+    if [[ -n "$new_topic_id" ]]; then
+        set_topic_mapping "$sname" "$new_topic_id" "${pane_pid:-0}"
+        log "Created session '$sname' with topic $new_topic_id"
+
+        # Notify in the requesting topic
+        local notify_text="New session <code>${sname}</code> (${mode} mode) created with topic"
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$notify_text"
+        else
+            send_general_message "$notify_text"
+        fi
+
+        # Welcome message in the new topic
+        send_message "$new_topic_id" "Session <code>${sname}</code> is ready (${mode} mode). Messages here route to Claude."
+    else
+        log "Failed to create topic for session '$sname'"
+        local err_text="Session <code>${sname}</code> created but topic creation failed. Check bot permissions."
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$err_text"
+        else
+            send_general_message "$err_text"
+        fi
+    fi
+}
+
+cmd_resume() {
+    local topic_id="$1"
+    log "Command: /resume"
+
+    # Get recent conversations
+    local -a conv_ids=()
+    local -a conv_summaries=()
+    local -a conv_ages=()
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        conv_ids+=("$(echo "$line" | cut -d'|' -f1)")
+        conv_ages+=("$(echo "$line" | cut -d'|' -f2)")
+        conv_summaries+=("$(echo "$line" | cut -d'|' -f3)")
+    done < <(MAX_RESULTS=10 recent-conversations 2>/dev/null || true)
+
+    if [[ ${#conv_ids[@]} -eq 0 ]]; then
+        local msg="<i>No recent conversations found</i>"
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$msg"
+        else
+            send_general_message "$msg"
+        fi
+        return
+    fi
+
+    local output="<b>Recent Conversations</b>\n\nReply with a number to resume:\n\n"
+    local i=1
+    for idx in "${!conv_ids[@]}"; do
+        local escaped_summary
+        escaped_summary=$(escape_html "${conv_summaries[$idx]}")
+        output+="<b>${i}.</b> ${escaped_summary} — ${conv_ages[$idx]}\n"
+        (( i++ )) || true
+    done
+
+    # Store resume state so we can pick up the reply
+    local resume_tmp="${CONFIG_DIR}/resume_pending.json"
+    local ids_json
+    ids_json=$(printf '%s\n' "${conv_ids[@]}" | jq -R . | jq -s .)
+    local summaries_json
+    summaries_json=$(printf '%s\n' "${conv_summaries[@]}" | jq -R . | jq -s .)
+    jq -n --argjson ids "$ids_json" --argjson summaries "$summaries_json" --argjson topic "$topic_id" \
+        '{ids: $ids, summaries: $summaries, topic_id: $topic, expires: (now + 120 | floor)}' \
+        > "$resume_tmp"
+
+    if (( topic_id > 0 )); then
+        send_message "$topic_id" "$output"
+    else
+        send_general_message "$output"
+    fi
+}
+
+handle_resume_reply() {
+    local topic_id="$1" text="$2"
+    local resume_tmp="${CONFIG_DIR}/resume_pending.json"
+
+    [[ ! -f "$resume_tmp" ]] && return 1
+
+    # Check expiry
+    local expires
+    expires=$(jq -r '.expires' "$resume_tmp") || return 1
+    local now
+    now=$(date +%s)
+    if (( now > expires )); then
+        rm -f "$resume_tmp"
+        return 1
+    fi
+
+    # Check if this is a number
+    [[ ! "$text" =~ ^[0-9]+$ ]] && return 1
+
+    local pick="$text"
+    local count
+    count=$(jq '.ids | length' "$resume_tmp")
+    if (( pick < 1 || pick > count )); then
+        return 1
+    fi
+
+    local conv_id conv_summary
+    conv_id=$(jq -r --argjson i "$((pick - 1))" '.ids[$i]' "$resume_tmp")
+    conv_summary=$(jq -r --argjson i "$((pick - 1))" '.summaries[$i]' "$resume_tmp")
+    rm -f "$resume_tmp"
+
+    log "Resuming conversation $conv_id ($conv_summary)"
+
+    local sname
+    sname=$(auto_session_name)
+
+    local claude_cmd="cd ${PROJECT_DIR} && claude --resume ${conv_id}"
+    tmux new-session -d -s "$sname" -c "$PROJECT_DIR"
+    tmux send-keys -t "$sname" "$claude_cmd" Enter
+
+    # Get pane PID for rename tracking
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$sname" -F '#{pane_pid}' 2>/dev/null | head -1) || true
+
+    # Check if there's an existing closed topic for this conversation
+    local existing_match
+    existing_match=$(find_inactive_topic_by_conv "$conv_id") || true
+    if [[ -n "$existing_match" ]]; then
+        local old_name old_tid
+        old_name=$(echo "$existing_match" | cut -d'|' -f1)
+        old_tid=$(echo "$existing_match" | cut -d'|' -f2)
+        reopen_topic "$old_tid" >/dev/null 2>&1 || true
+        edit_topic_name "$old_tid" "${conv_summary:0:128}" >/dev/null 2>&1 || true
+        reactivate_topic_mapping "$old_name" "$sname" "${pane_pid:-0}"
+        log "Reopened topic $old_tid for resumed '$conv_summary' as '$sname'"
+
+        local escaped_summary
+        escaped_summary=$(escape_html "$conv_summary")
+        send_message "$old_tid" "Resumed as <code>${sname}</code>. History above ↑"
+        local notify_text="Resumed <b>${escaped_summary}</b> — reopened existing topic"
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$notify_text"
+        else
+            send_general_message "$notify_text"
+        fi
+        return 0
+    fi
+
+    # No existing topic — create a new one
+    local response
+    response=$(create_topic "${conv_summary:0:128}" "$COLOR_BLUE")
+    local new_topic_id
+    new_topic_id=$(echo "$response" | jq -r '.result.message_thread_id // empty') || true
+
+    if [[ -n "$new_topic_id" ]]; then
+        set_topic_mapping "$sname" "$new_topic_id" "${pane_pid:-0}" "$conv_id"
+        log "Resumed '$conv_summary' as '$sname' with topic $new_topic_id"
+
+        local notify_text
+        local escaped_summary
+        escaped_summary=$(escape_html "$conv_summary")
+        notify_text="Resumed <b>${escaped_summary}</b> as <code>${sname}</code>"
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$notify_text"
+        else
+            send_general_message "$notify_text"
+        fi
+        send_message "$new_topic_id" "Resumed session. Messages here route to Claude."
+    else
+        local notify_text="Resumed as <code>${sname}</code> but topic creation failed."
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$notify_text"
+        else
+            send_general_message "$notify_text"
+        fi
+    fi
+
+    return 0
+}
+
+cmd_kill() {
+    local topic_id="$1" target="${2:-}"
+    log "Command: /kill $target"
+
+    # Enable with ENABLE_KILL=true in .env
+    if [[ "$ENABLE_KILL" != "true" ]]; then
+        local msg="<i>/kill is disabled. Set ENABLE_KILL=true in .env to enable.</i>"
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$msg"
+        else
+            send_general_message "$msg"
+        fi
+        return
+    fi
+
+    if [[ -z "$target" ]]; then
+        local msg="Usage: /kill &lt;session-number&gt;\nUse /sessions to see the list."
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$msg"
+        else
+            send_general_message "$msg"
+        fi
+        return
+    fi
+
+    # Get session list and pick by number
+    local -a sessions=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        sessions+=("$(echo "$line" | cut -d'|' -f1)")
+    done < <(get_claude_sessions)
+
+    if [[ ! "$target" =~ ^[0-9]+$ ]] || (( target < 1 || target > ${#sessions[@]} )); then
+        local msg="Invalid session number. Use /sessions to see the list."
+        if (( topic_id > 0 )); then
+            send_message "$topic_id" "$msg"
+        else
+            send_general_message "$msg"
+        fi
+        return
+    fi
+
+    local sess_name="${sessions[$((target - 1))]}"
+    local sess_topic
+    sess_topic=$(get_topic_for_session "$sess_name")
+
+    tmux kill-session -t "$sess_name" 2>/dev/null || true
+    mark_topic_inactive "$sess_name"
+
+    if [[ -n "$sess_topic" ]]; then
+        close_topic "$sess_topic" >/dev/null 2>&1 || true
+    fi
+
+    local msg="Killed session <code>${sess_name}</code>"
+    if (( topic_id > 0 )); then
+        send_message "$topic_id" "$msg"
+    else
+        send_general_message "$msg"
+    fi
+    log "Killed session '$sess_name'"
+}
+
+cmd_approval() {
+    local topic_id="$1" answer="${2:-}"
+    log "Command: /approval $answer"
+
+    if (( topic_id == 0 )); then
+        send_general_message "<i>/approval must be used in a session topic</i>"
+        return
+    fi
+
+    local session_name
+    session_name=$(get_session_for_topic "$topic_id")
+    if [[ -z "$session_name" ]]; then
+        send_message "$topic_id" "<i>No session mapped to this topic</i>"
+        return
+    fi
+
+    if ! tmux has-session -t "$session_name" 2>/dev/null; then
+        send_message "$topic_id" "<i>Session ended.</i>"
+        mark_topic_inactive "$session_name"
+        return
+    fi
+
+    case "$answer" in
+        yes|y)
+            tmux send-keys -t "$session_name" "y" Enter
+            send_message "$topic_id" "Approved ✓"
+            ;;
+        no|n)
+            tmux send-keys -t "$session_name" "n" Enter
+            send_message "$topic_id" "Denied ✗"
+            ;;
+        *)
+            send_message "$topic_id" "Usage: <code>/approval yes</code> or <code>/approval no</code>
+Shorthand: <code>/approval y</code> / <code>/approval n</code>
+
+Use this to respond to Claude's permission prompts."
+            ;;
+    esac
+}
+
+cmd_screenshot() {
+    local topic_id="$1"
+    log "Command: /screenshot"
+
+    if (( topic_id == 0 )); then
+        send_general_message "<i>/screenshot must be used in a session topic</i>"
+        return
+    fi
+
+    local session_name
+    session_name=$(get_session_for_topic "$topic_id")
+    if [[ -z "$session_name" ]]; then
+        send_message "$topic_id" "<i>No session mapped to this topic</i>"
+        return
+    fi
+
+    if ! tmux has-session -t "$session_name" 2>/dev/null; then
+        send_message "$topic_id" "<i>Session ended.</i>"
+        mark_topic_inactive "$session_name"
+        return
+    fi
+
+    local pane_output
+    pane_output=$(tmux capture-pane -t "$session_name" -p -S -50 2>/dev/null) || true
+
+    if [[ -z "$pane_output" ]]; then
+        send_message "$topic_id" "<i>Empty screen</i>"
+        return
+    fi
+
+    local escaped_output
+    escaped_output=$(escape_html "$pane_output")
+
+    local msg="<pre>${escaped_output}</pre>"
+    if (( ${#msg} > 4096 )); then
+        # Truncate to last 50 lines and re-escape
+        pane_output=$(echo "$pane_output" | tail -50)
+        escaped_output=$(escape_html "$pane_output")
+        msg="<i>(truncated)</i>
+<pre>${escaped_output}</pre>"
+        # If still too long, hard-truncate
+        if (( ${#msg} > 4096 )); then
+            msg="${msg:0:4080}...</pre>"
+        fi
+    fi
+
+    send_message "$topic_id" "$msg"
+}
+
+cmd_help() {
+    local topic_id="$1"
+    local text="<b>Telegram Bridge Commands</b>
+
+/sessions — List active Claude tmux sessions
+/new [danger|normal] — Launch a new Claude session (default: normal)
+/resume — List recent conversations to resume
+/approval [yes|no] — Approve or deny a pending permission prompt
+/screenshot — Capture and send the current terminal screen
+/help — Show this help
+
+Messages in a session topic are sent directly to Claude.
+📎 Send files or voice messages directly in a session topic"
+
+    # /kill is built but disabled
+    # /kill N — Kill the Nth session (enable with ENABLE_KILL=true in .env)
+
+    if (( topic_id > 0 )); then
+        send_message "$topic_id" "$text"
+    else
+        send_general_message "$text"
+    fi
+}
+
+# ── JSONL transcript watcher ──────────────────────────────────────────
+
+# Start a persistent JSONL watcher for a session.
+# Tails the conversation JSONL file and sends new assistant/user messages
+# to the mapped Telegram topic.
+start_watcher() {
+    local session_name="$1" topic_id="$2"
+    local watcher_pid_file="${WATCHERS_DIR}/${session_name}.pid"
+
+    # Kill existing watcher for this session
+    stop_watcher "$session_name"
+
+    (
+        # Give the session a moment to start and create a JSONL
+        local conv_id=""
+        local jsonl_file=""
+        local wait_count=0
+
+        while [[ -z "$conv_id" ]] && (( wait_count < 60 )); do
+            conv_id=$(get_conv_id_for_session "$session_name" 2>/dev/null) || true
+            if [[ -n "$conv_id" ]]; then
+                jsonl_file="${CONV_DIR}/${conv_id}.jsonl"
+                if [[ -f "$jsonl_file" ]]; then
+                    break
+                fi
+                conv_id=""
+            fi
+            sleep 3
+            (( wait_count++ )) || true
+            # Check session still alive
+            if ! tmux has-session -t "$session_name" 2>/dev/null; then
+                exit 0
+            fi
+        done
+
+        if [[ -z "$conv_id" || ! -f "$jsonl_file" ]]; then
+            exit 0
+        fi
+
+        log "Watcher: started for '$session_name' conv=$conv_id topic=$topic_id"
+
+        local offset_file="${OFFSETS_DIR}/${conv_id}.offset"
+        local last_sent_file="${LAST_SENT_DIR}/${session_name}"
+        local last_send_time=0
+
+        # Initialize offset to current file size (skip history)
+        if [[ ! -f "$offset_file" ]]; then
+            wc -c < "$jsonl_file" > "$offset_file"
+        fi
+
+        while true; do
+            sleep 3
+
+            # Check session still alive
+            if ! tmux has-session -t "$session_name" 2>/dev/null; then
+                log "Watcher: session '$session_name' gone, exiting"
+                break
+            fi
+
+            # Check JSONL still exists (conversation ID might change on compaction)
+            if [[ ! -f "$jsonl_file" ]]; then
+                # Try to re-resolve conversation ID
+                local new_conv_id
+                new_conv_id=$(get_conv_id_for_session "$session_name" 2>/dev/null) || true
+                if [[ -n "$new_conv_id" && -f "${CONV_DIR}/${new_conv_id}.jsonl" ]]; then
+                    conv_id="$new_conv_id"
+                    jsonl_file="${CONV_DIR}/${conv_id}.jsonl"
+                    offset_file="${OFFSETS_DIR}/${conv_id}.offset"
+                    if [[ ! -f "$offset_file" ]]; then
+                        wc -c < "$jsonl_file" > "$offset_file"
+                    fi
+                    log "Watcher: conv ID changed for '$session_name', now $conv_id"
+                else
+                    continue
+                fi
+            fi
+
+            local current_size
+            current_size=$(wc -c < "$jsonl_file" 2>/dev/null) || continue
+            local stored_offset
+            stored_offset=$(cat "$offset_file" 2>/dev/null) || stored_offset=0
+            stored_offset="${stored_offset:-0}"
+
+            # Nothing new — check if Working... should be cleared (idle 10s)
+            if (( current_size <= stored_offset )); then
+                local working_file="${CONFIG_DIR}/working_${session_name}"
+                local activity_file="${CONFIG_DIR}/activity_${session_name}"
+                if [[ -f "$working_file" && -f "$activity_file" ]]; then
+                    local last_activity
+                    last_activity=$(cat "$activity_file" 2>/dev/null) || last_activity=0
+                    local now_check
+                    now_check=$(date +%s)
+                    if (( now_check - last_activity >= 30 )); then
+                        local w_id
+                        w_id=$(cat "$working_file" 2>/dev/null) || true
+                        if [[ -n "$w_id" ]]; then
+                            edit_message "$w_id" "✓ Done" "" >/dev/null 2>&1 || true
+                        fi
+                        rm -f "$working_file" "$activity_file"
+                    fi
+                fi
+                continue
+            fi
+
+            # Read new bytes
+            local new_data
+            new_data=$(tail -c +"$((stored_offset + 1))" "$jsonl_file" 2>/dev/null) || continue
+
+            # Update offset immediately
+            echo "$current_size" > "$offset_file"
+
+            # Process each line
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+
+                local msg_type
+                msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null) || continue
+
+                # Skip pure noise types (no activity signal)
+                [[ "$msg_type" == "file-history-snapshot" || "$msg_type" == "system" ]] && continue
+
+                # Track activity for Working... indicator (assistant, user, queue-operation all count)
+                local working_file="${CONFIG_DIR}/working_${session_name}"
+                local activity_file="${CONFIG_DIR}/activity_${session_name}"
+                echo "$(date +%s)" > "$activity_file"
+
+                # Skip queue-operation after tracking activity (teammate work, not displayable)
+                [[ "$msg_type" == "queue-operation" ]] && continue
+
+                if [[ "$msg_type" == "assistant" ]]; then
+                    # Extract text content from assistant message
+                    local text_content
+                    text_content=$(echo "$line" | jq -r '
+                        .message.content[]? |
+                        select(.type == "text") |
+                        .text // empty
+                    ' 2>/dev/null) || continue
+
+                    [[ -z "$text_content" ]] && continue
+
+                    # Rate limit: 1 message/sec
+                    local now_ms
+                    now_ms=$(date +%s)
+                    if (( now_ms <= last_send_time )); then
+                        sleep 1
+                    fi
+                    last_send_time=$(date +%s)
+
+                    local escaped_text
+                    escaped_text=$(escape_html "$text_content")
+
+                    # Build message: short = plain, long = preview + expandable
+                    local final_msg=""
+                    if (( ${#text_content} <= 200 )); then
+                        final_msg="$escaped_text"
+                    elif (( ${#escaped_text} <= 3800 )); then
+                        local preview
+                        preview=$(escape_html "${text_content:0:200}")
+                        final_msg="${preview}...
+<blockquote expandable>${escaped_text}</blockquote>"
+                    else
+                        local preview
+                        preview=$(escape_html "${text_content:0:200}")
+                        final_msg="${preview}...
+<blockquote expandable>${escaped_text:0:3600}</blockquote>"
+                    fi
+
+                    # Always send as new message (don't replace Working...)
+                    local send_result
+                    send_result=$(send_message "$topic_id" "$final_msg" "HTML" 2>/dev/null) || true
+                    local send_ok
+                    send_ok=$(echo "$send_result" | jq -r '.ok // false' 2>/dev/null) || true
+                    if [[ "$send_ok" != "true" ]]; then
+                        send_message "$topic_id" "${text_content:0:4000}" "" >/dev/null 2>&1 || true
+                    fi
+
+                    # If very long, send remaining chunks
+                    if (( ${#escaped_text} > 3800 )); then
+                        local chunk_offset=3600
+                        while (( chunk_offset < ${#escaped_text} )); do
+                            sleep 1
+                            local chunk="${escaped_text:$chunk_offset:3800}"
+                            send_message "$topic_id" "<blockquote expandable>${chunk}</blockquote>" "HTML" >/dev/null 2>&1 || true
+                            (( chunk_offset += 3800 )) || true
+                        done
+                    fi
+
+                elif [[ "$msg_type" == "human" || "$msg_type" == "user" ]]; then
+                    # Skip tool_result entries — they're not user messages
+                    local has_tool_result
+                    has_tool_result=$(echo "$line" | jq -r '.message.content[]? | select(.type == "tool_result") | .type' 2>/dev/null | head -1) || true
+                    [[ -n "$has_tool_result" ]] && continue
+
+                    # Extract only text content from user messages
+                    local user_text
+                    user_text=$(echo "$line" | jq -r '
+                        .message.content[]? |
+                        select(.type == "text") |
+                        .text // empty
+                    ' 2>/dev/null) || continue
+
+                    # Fallback: content might be a plain string
+                    if [[ -z "$user_text" ]]; then
+                        local content_type
+                        content_type=$(echo "$line" | jq -r '.message.content | type' 2>/dev/null) || continue
+                        if [[ "$content_type" == "string" ]]; then
+                            user_text=$(echo "$line" | jq -r '.message.content' 2>/dev/null) || continue
+                        else
+                            continue
+                        fi
+                    fi
+
+                    [[ -z "$user_text" ]] && continue
+
+                    # Skip if this was sent from Telegram (avoid echo)
+                    if [[ -f "$last_sent_file" ]]; then
+                        local last_sent
+                        last_sent=$(cat "$last_sent_file" 2>/dev/null) || true
+                        if [[ "$user_text" == "$last_sent" ]]; then
+                            rm -f "$last_sent_file"
+                            continue
+                        fi
+                    fi
+
+                    # Rate limit
+                    local now_ms
+                    now_ms=$(date +%s)
+                    if (( now_ms <= last_send_time )); then
+                        sleep 1
+                    fi
+                    last_send_time=$(date +%s)
+
+                    local escaped_user
+                    escaped_user=$(escape_html "$user_text")
+                    # Truncate very long user messages
+                    if (( ${#escaped_user} > 3900 )); then
+                        escaped_user="${escaped_user:0:3900}..."
+                    fi
+                    send_message "$topic_id" "👤 ${escaped_user}" "HTML" >/dev/null 2>&1 || true
+
+                    # Send "Working..." so Telegram shows Claude is processing
+                    local working_response
+                    working_response=$(send_message "$topic_id" "Working...")
+                    local w_msg_id
+                    w_msg_id=$(echo "$working_response" | jq -r '.result.message_id // empty') || true
+                    if [[ -n "$w_msg_id" ]]; then
+                        local working_file="${CONFIG_DIR}/working_${session_name}"
+                        echo "$w_msg_id" > "$working_file"
+                        # Background: add dots every 30s
+                        (
+                            local dots=0
+                            while [[ -f "$working_file" ]]; do
+                                sleep 30
+                                [[ -f "$working_file" ]] || break
+                                (( dots++ )) || true
+                                local dot_str=""
+                                for (( d=0; d<dots; d++ )); do dot_str+="."; done
+                                edit_message "$w_msg_id" "Working...${dot_str}" "" >/dev/null 2>&1 || true
+                            done
+                        ) &
+                    fi
+                fi
+
+            done <<< "$new_data"
+        done
+
+        # Cleanup
+        rm -f "$watcher_pid_file"
+        log "Watcher: exited for '$session_name'"
+    ) &
+
+    echo $! > "$watcher_pid_file"
+    log "Watcher: launched PID $! for '$session_name' topic=$topic_id"
+}
+
+# Stop a watcher for a session
+stop_watcher() {
+    local session_name="$1"
+    local watcher_pid_file="${WATCHERS_DIR}/${session_name}.pid"
+
+    if [[ -f "$watcher_pid_file" ]]; then
+        local old_pid
+        old_pid=$(cat "$watcher_pid_file" 2>/dev/null) || true
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" 2>/dev/null || true
+            wait "$old_pid" 2>/dev/null || true
+        fi
+        rm -f "$watcher_pid_file"
+    fi
+}
+
+# Check if a watcher is running for a session
+watcher_running() {
+    local session_name="$1"
+    local watcher_pid_file="${WATCHERS_DIR}/${session_name}.pid"
+
+    if [[ -f "$watcher_pid_file" ]]; then
+        local pid
+        pid=$(cat "$watcher_pid_file" 2>/dev/null) || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$watcher_pid_file"
+    fi
+    return 1
+}
+
+# ── Message routing ───────────────────────────────────────────────────
+
+route_message() {
+    local topic_id="$1" text="$2"
+
+    # Find which session this topic maps to
+    local session_name
+    session_name=$(get_session_for_topic "$topic_id")
+
+    if [[ -z "$session_name" ]]; then
+        log "No session mapped to topic $topic_id"
+        return
+    fi
+
+    # Check session still exists
+    if ! tmux has-session -t "$session_name" 2>/dev/null; then
+        log "Session '$session_name' no longer exists"
+        mark_topic_inactive "$session_name"
+        send_message "$topic_id" "<i>Session ended.</i>"
+        return
+    fi
+
+    log "Routing message to session '$session_name': ${text:0:50}..."
+
+    # Record what we sent so the JSONL watcher can skip the echo
+    local last_sent_file="${LAST_SENT_DIR}/${session_name}"
+    echo "$text" > "$last_sent_file"
+
+    # Inject message into tmux session
+    tmux send-keys -t "$session_name" -- "$text" Enter
+
+    # Send delivery confirmation
+    send_message "$topic_id" "Message sent ✓" >/dev/null 2>&1 || true
+
+    # Send "Working..." message and store its ID for the watcher to edit
+    local response
+    response=$(send_message "$topic_id" "Working...")
+    local working_msg_id
+    working_msg_id=$(echo "$response" | jq -r '.result.message_id // empty') || true
+
+    if [[ -n "$working_msg_id" ]]; then
+        local working_file="${CONFIG_DIR}/working_${session_name}"
+        echo "$working_msg_id" > "$working_file"
+
+        # Background: add dots every 30s until the watcher clears the file
+        (
+            local dots=0
+            while [[ -f "$working_file" ]]; do
+                sleep 30
+                [[ -f "$working_file" ]] || break
+                (( dots++ )) || true
+                local dot_str=""
+                for (( d=0; d<dots; d++ )); do dot_str+="."; done
+                edit_message "$working_msg_id" "Working...${dot_str}" "" >/dev/null 2>&1 || true
+            done
+        ) &
+    fi
+
+    # Ensure watcher is running for this session
+    if ! watcher_running "$session_name"; then
+        start_watcher "$session_name" "$topic_id"
+    fi
+}
+
+# ── Session detection loop ────────────────────────────────────────────
+
+check_sessions() {
+    # Get current Claude sessions with PIDs
+    local -a current_sessions=()
+    local -a current_pids=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        current_sessions+=("$(echo "$line" | cut -d'|' -f1)")
+        current_pids+=("$(echo "$line" | cut -d'|' -f2)")
+    done < <(get_claude_sessions)
+
+    # Build list of mapped sessions that are "gone" (not in current)
+    local -a gone_sessions=()
+    local mapped_sessions
+    mapped_sessions=$(jq -r '.topics | to_entries[] | select(.value.active == true) | .key' "$STATE_FILE" 2>/dev/null) || true
+
+    while IFS= read -r sess; do
+        [[ -z "$sess" ]] && continue
+        local found=false
+        for current in "${current_sessions[@]+"${current_sessions[@]}"}"; do
+            [[ "$current" == "$sess" ]] && found=true && break
+        done
+        [[ "$found" == "false" ]] && gone_sessions+=("$sess")
+    done <<< "$mapped_sessions"
+
+    # FIRST: Detect renames — a "new" session with the same PID as a "gone" session
+    local -a handled_new=()
+    local -a handled_gone=()
+
+    for idx in "${!current_sessions[@]}"; do
+        local sess="${current_sessions[$idx]}"
+        local pid="${current_pids[$idx]}"
+
+        # Skip if already has a topic
+        local existing_topic
+        existing_topic=$(get_topic_for_session "$sess")
+        [[ -n "$existing_topic" ]] && continue
+
+        # This is a "new" session — check if any gone session has the same PID
+        for gone_sess in "${gone_sessions[@]+"${gone_sessions[@]}"}"; do
+            local gone_pid
+            gone_pid=$(jq -r --arg s "$gone_sess" '.topics[$s].pane_pid // "0"' "$STATE_FILE" 2>/dev/null) || true
+
+            if [[ -n "$pid" && "$pid" != "0" && "$pid" == "$gone_pid" ]]; then
+                # Same PID = rename, not a new session
+                local tid
+                tid=$(get_topic_for_session "$gone_sess")
+                if [[ -n "$tid" ]]; then
+                    edit_topic_name "$tid" "${sess:0:128}" >/dev/null 2>&1 || true
+                    rename_topic_mapping "$gone_sess" "$sess"
+                    # Update PID in state
+                    local tmp="${STATE_FILE}.tmp"
+                    jq --arg s "$sess" --arg pid "$pid" '.topics[$s].pane_pid = $pid' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+                    log "Detected rename: '$gone_sess' → '$sess', updated topic $tid"
+                    # Migrate watcher: stop old, start new if not running
+                    stop_watcher "$gone_sess"
+                    if ! watcher_running "$sess"; then
+                        start_watcher "$sess" "$tid"
+                    fi
+                    handled_new+=("$sess")
+                    handled_gone+=("$gone_sess")
+                fi
+                break
+            fi
+        done
+    done
+
+    # SECOND: Create topics for sessions without active topics
+    for idx in "${!current_sessions[@]}"; do
+        local sess="${current_sessions[$idx]}"
+        local pid="${current_pids[$idx]}"
+
+        local existing_topic
+        existing_topic=$(get_topic_for_session "$sess")
+        [[ -n "$existing_topic" ]] && continue
+
+        # Skip if this was handled as a rename
+        local was_rename=false
+        for h in "${handled_new[@]+"${handled_new[@]}"}"; do
+            [[ "$h" == "$sess" ]] && was_rename=true && break
+        done
+        [[ "$was_rename" == "true" ]] && continue
+
+        # Get conversation ID for state tracking
+        local conv_id
+        conv_id=$(get_conv_id_for_session "$sess") || true
+
+        # Clean up any stale inactive entry for this session name
+        local tmp="${STATE_FILE}.tmp"
+        jq --arg s "$sess" 'if .topics[$s].active == false then del(.topics[$s]) else . end' \
+            "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+
+        # Create a fresh topic
+        log "Creating topic for session: $sess"
+        local response
+        response=$(create_topic "$sess" "$COLOR_GREEN")
+        local new_topic_id
+        new_topic_id=$(echo "$response" | jq -r '.result.message_thread_id // empty') || true
+        if [[ -n "$new_topic_id" ]]; then
+            set_topic_mapping "$sess" "$new_topic_id" "$pid" "$conv_id"
+            log "Created topic $new_topic_id for session $sess"
+            start_watcher "$sess" "$new_topic_id"
+        else
+            log "Failed to create topic for session $sess"
+        fi
+    done
+
+    # THIRD: Mark genuinely gone sessions as inactive (not renames)
+    for gone_sess in "${gone_sessions[@]+"${gone_sessions[@]}"}"; do
+        local was_rename=false
+        for h in "${handled_gone[@]+"${handled_gone[@]}"}"; do
+            [[ "$h" == "$gone_sess" ]] && was_rename=true && break
+        done
+        [[ "$was_rename" == "true" ]] && continue
+
+        log "Session '$gone_sess' gone, deleting topic"
+        stop_watcher "$gone_sess"
+        local tid
+        tid=$(get_topic_for_session "$gone_sess")
+        if [[ -n "$tid" ]]; then
+            delete_topic "$tid" >/dev/null 2>&1 || true
+        fi
+        mark_topic_inactive "$gone_sess"
+    done
+
+    # FOURTH: Ensure watchers are running for all active sessions with topics
+    for idx in "${!current_sessions[@]}"; do
+        local sess="${current_sessions[$idx]}"
+        local topic
+        topic=$(get_topic_for_session "$sess") || true
+        if [[ -n "$topic" ]] && ! watcher_running "$sess"; then
+            start_watcher "$sess" "$topic"
+        fi
+    done
+}
+
+# ── Clean shutdown ────────────────────────────────────────────────────
+
+cleanup() {
+    log "Shutting down..."
+    # Kill all JSONL watchers
+    for pid_file in "${WATCHERS_DIR}"/*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null) || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    done
+    # Clean up any leftover monitor PIDs from old version
+    for pid_file in "${CONFIG_DIR}"/monitor_*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null) || true
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$pid_file"
+    done
+    log "Shutdown complete"
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT
+
+# ── File & voice handling ─────────────────────────────────────────────
+
+# Download a file from Telegram by file_id, save to TMP_DIR with given filename
+tg_download_file() {
+    local file_id="$1" filename="$2"
+    local dest="${TMP_DIR}/${filename}"
+
+    # Get file path from Telegram
+    local response
+    response=$(curl -s "${API}/getFile" -H "Content-Type: application/json" \
+        -d "$(jq -n --arg fid "$file_id" '{file_id: $fid}')") || true
+
+    local file_path
+    file_path=$(echo "$response" | jq -r '.result.file_path // empty' 2>/dev/null) || true
+
+    if [[ -z "$file_path" ]]; then
+        log "Failed to get file path for file_id=$file_id"
+        return 1
+    fi
+
+    # Download the file
+    curl -s -o "$dest" "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}" || return 1
+    log "Downloaded file: $dest"
+    echo "$dest"
+}
+
+# Handle a file message (document, photo, video, audio)
+handle_file_message() {
+    local message="$1" topic_id="$2"
+    local file_id="" filename="" file_type=""
+    local timestamp
+    timestamp=$(date +%s)
+
+    # Detect file type and extract file_id / filename
+    if echo "$message" | jq -e '.document' >/dev/null 2>&1; then
+        file_type="document"
+        file_id=$(echo "$message" | jq -r '.document.file_id // empty')
+        filename=$(echo "$message" | jq -r '.document.file_name // empty')
+        [[ -z "$filename" ]] && filename="document_${timestamp}"
+    elif echo "$message" | jq -e '.photo' >/dev/null 2>&1; then
+        file_type="photo"
+        # Pick the largest photo (last element in the array)
+        file_id=$(echo "$message" | jq -r '.photo[-1].file_id // empty')
+        filename="photo_${timestamp}.jpg"
+    elif echo "$message" | jq -e '.video' >/dev/null 2>&1; then
+        file_type="video"
+        file_id=$(echo "$message" | jq -r '.video.file_id // empty')
+        filename="video_${timestamp}.mp4"
+    elif echo "$message" | jq -e '.audio' >/dev/null 2>&1; then
+        file_type="audio"
+        file_id=$(echo "$message" | jq -r '.audio.file_id // empty')
+        filename=$(echo "$message" | jq -r '.audio.file_name // empty')
+        [[ -z "$filename" ]] && filename="audio_${timestamp}.mp3"
+    elif echo "$message" | jq -e '.voice' >/dev/null 2>&1; then
+        file_type="voice"
+        file_id=$(echo "$message" | jq -r '.voice.file_id // empty')
+        filename="voice_${timestamp}.ogg"
+    else
+        return 1  # No file detected
+    fi
+
+    if [[ -z "$file_id" ]]; then
+        return 1
+    fi
+
+    log "File detected: type=$file_type file_id=${file_id:0:20}... filename=$filename"
+
+    # Download the file
+    local dest
+    dest=$(tg_download_file "$file_id" "$filename") || {
+        send_message "$topic_id" "<i>Failed to download file</i>"
+        return 0
+    }
+
+    # Voice messages get special handling — transcribe
+    if [[ "$file_type" == "voice" ]]; then
+        handle_voice_transcription "$dest" "$filename" "$topic_id"
+        return 0
+    fi
+
+    # Confirm download
+    send_message "$topic_id" "📎 File saved to <code>${dest}</code>"
+
+    # If mapped to a session, notify Claude
+    if (( topic_id > 0 )); then
+        local session_name
+        session_name=$(get_session_for_topic "$topic_id")
+        if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
+            tmux send-keys -t "$session_name" "A file has been uploaded to ${dest} — please read it" Enter
+        fi
+    fi
+
+    return 0
+}
+
+# Handle voice message transcription
+handle_voice_transcription() {
+    local filepath="$1" filename="$2" topic_id="$3"
+    local transcription=""
+
+    if [[ -n "$GROQ_API_KEY" ]]; then
+        log "Transcribing voice with Groq Whisper"
+        local response
+        response=$(curl -s -X POST "https://api.groq.com/openai/v1/audio/transcriptions" \
+            -H "Authorization: Bearer ${GROQ_API_KEY}" \
+            -F "file=@${filepath}" \
+            -F "model=whisper-large-v3") || true
+        transcription=$(echo "$response" | jq -r '.text // empty' 2>/dev/null) || true
+    elif [[ -n "$OPENAI_API_KEY" ]]; then
+        log "Transcribing voice with OpenAI Whisper"
+        local response
+        response=$(curl -s -X POST "https://api.openai.com/v1/audio/transcriptions" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -F "file=@${filepath}" \
+            -F "model=whisper-1") || true
+        transcription=$(echo "$response" | jq -r '.text // empty' 2>/dev/null) || true
+    else
+        send_message "$topic_id" "<i>Voice transcription unavailable — set GROQ_API_KEY or OPENAI_API_KEY in .env</i>"
+        rm -f "$filepath"
+        return
+    fi
+
+    # Clean up voice file
+    rm -f "$filepath"
+
+    if [[ -z "$transcription" ]]; then
+        send_message "$topic_id" "<i>Voice transcription failed</i>"
+        return
+    fi
+
+    log "Voice transcription: ${transcription:0:80}..."
+
+    # Send transcription to topic
+    local escaped_transcription
+    escaped_transcription=$(escape_html "$transcription")
+    send_message "$topic_id" "🎤 <i>${escaped_transcription}</i>"
+
+    # If mapped to a session, inject the transcription
+    if (( topic_id > 0 )); then
+        local session_name
+        session_name=$(get_session_for_topic "$topic_id")
+        if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
+            # Record what we sent so the JSONL watcher can skip the echo
+            local last_sent_file="${LAST_SENT_DIR}/${session_name}"
+            echo "$transcription" > "$last_sent_file"
+            tmux send-keys -t "$session_name" -- "$transcription" Enter
+        fi
+    fi
+}
+
+# ── Main loop ─────────────────────────────────────────────────────────
+
+main_loop() {
+    log "Telegram bridge started"
+    init_state
+
+    local last_session_check=0
+
+    while true; do
+        local now
+        now=$(date +%s)
+
+        # Session detection check every SESSION_CHECK_INTERVAL seconds
+        if (( now - last_session_check >= SESSION_CHECK_INTERVAL )); then
+            check_sessions
+            last_session_check="$now"
+        fi
+
+        # Poll for updates
+        local offset
+        offset=$(get_offset)
+        local offset_param=""
+        if (( offset > 0 )); then
+            offset_param="\"offset\": $((offset + 1)),"
+        fi
+
+        local updates
+        updates=$(curl -s -m 5 "${API}/getUpdates" \
+            -H "Content-Type: application/json" \
+            -d "{${offset_param} \"timeout\": ${POLL_INTERVAL}}") || true
+
+        if [[ -z "$updates" ]]; then
+            continue
+        fi
+
+        local ok
+        ok=$(echo "$updates" | jq -r '.ok' 2>/dev/null) || true
+        if [[ "$ok" != "true" ]]; then
+            # Check for rate limit
+            local error_code
+            error_code=$(echo "$updates" | jq -r '.error_code' 2>/dev/null) || true
+            if [[ "$error_code" == "429" ]]; then
+                local retry_after
+                retry_after=$(echo "$updates" | jq -r '.parameters.retry_after // 5' 2>/dev/null) || true
+                log "Rate limited on getUpdates, sleeping ${retry_after}s"
+                sleep "$retry_after"
+            fi
+            continue
+        fi
+
+        local result_count
+        result_count=$(echo "$updates" | jq '.result | length' 2>/dev/null) || true
+        if [[ "$result_count" == "0" || -z "$result_count" ]]; then
+            continue
+        fi
+
+        # Process each update
+        local i=0
+        while (( i < result_count )); do
+            local update
+            update=$(echo "$updates" | jq ".result[$i]")
+            local update_id
+            update_id=$(echo "$update" | jq -r '.update_id')
+
+            # Update offset
+            set_offset "$update_id"
+
+            # Extract message
+            local message
+            message=$(echo "$update" | jq '.message // empty')
+            if [[ -z "$message" || "$message" == "null" ]]; then
+                (( i++ )) || true
+                continue
+            fi
+
+            # Security: only process messages from allowed user
+            local from_id
+            from_id=$(echo "$message" | jq -r '.from.id // empty')
+            if [[ "$from_id" != "$ALLOWED_USER" ]]; then
+                (( i++ )) || true
+                continue
+            fi
+
+            # Get topic ID
+            local topic_id
+            topic_id=$(echo "$message" | jq -r '.message_thread_id // 0')
+
+            # Check for file/voice/photo/video/audio BEFORE text processing
+            local has_file=false
+            if echo "$message" | jq -e '.voice // .document // .photo // .video // .audio' >/dev/null 2>&1; then
+                has_file=true
+                if (( topic_id > 0 )); then
+                    handle_file_message "$message" "$topic_id" || true
+                else
+                    send_general_message "<i>Send files in a session topic, not the general chat</i>"
+                fi
+            fi
+
+            # Get text (could be a caption on a file, or a regular message)
+            local text
+            text=$(echo "$message" | jq -r '.text // .caption // empty')
+
+            if [[ -z "$text" ]]; then
+                (( i++ )) || true
+                continue
+            fi
+
+            log "Message from topic $topic_id: ${text:0:80}"
+
+            # Check for commands
+            case "$text" in
+                /sessions|/sessions@*)
+                    cmd_sessions "$topic_id"
+                    ;;
+                /new*)
+                    local mode="normal"
+                    if [[ "$text" =~ /new[[:space:]]+(danger|normal) ]]; then
+                        mode="${BASH_REMATCH[1]}"
+                    fi
+                    cmd_new "$topic_id" "$mode"
+                    ;;
+                /resume|/resume@*)
+                    cmd_resume "$topic_id"
+                    ;;
+                /kill*)
+                    local target=""
+                    if [[ "$text" =~ /kill[[:space:]]+([0-9]+) ]]; then
+                        target="${BASH_REMATCH[1]}"
+                    fi
+                    cmd_kill "$topic_id" "$target"
+                    ;;
+                /approval*)
+                    local answer=""
+                    if [[ "$text" =~ /approval[[:space:]]+(.*) ]]; then
+                        answer="${BASH_REMATCH[1]}"
+                        # Normalize: strip whitespace and lowercase
+                        answer=$(echo "$answer" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+                    fi
+                    cmd_approval "$topic_id" "$answer"
+                    ;;
+                /screenshot|/screenshot@*)
+                    cmd_screenshot "$topic_id"
+                    ;;
+                /help|/help@*|/start|/start@*)
+                    cmd_help "$topic_id"
+                    ;;
+                *)
+                    # If this text came with a file, don't also route it as a message
+                    if [[ "$has_file" == "true" ]]; then
+                        :
+                    # Check if this is a resume reply
+                    elif handle_resume_reply "$topic_id" "$text" 2>/dev/null; then
+                        :
+                    elif (( topic_id > 0 )); then
+                        # Route to session
+                        route_message "$topic_id" "$text"
+                    fi
+                    ;;
+            esac
+
+            (( i++ )) || true
+        done
+    done
+}
+
+main_loop
