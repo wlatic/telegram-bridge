@@ -686,11 +686,11 @@ cmd_approval() {
 
     case "$answer" in
         yes|y)
-            tmux send-keys -t "$session_name" "y" Enter
+            tmux send-keys -t "${session_name}:1.1" "y" Enter
             send_message "$topic_id" "Approved ✓"
             ;;
         no|n)
-            tmux send-keys -t "$session_name" "n" Enter
+            tmux send-keys -t "${session_name}:1.1" "n" Enter
             send_message "$topic_id" "Denied ✗"
             ;;
         *)
@@ -725,7 +725,7 @@ cmd_screenshot() {
     fi
 
     local pane_output
-    pane_output=$(tmux capture-pane -t "$session_name" -p -S -50 2>/dev/null) || true
+    pane_output=$(tmux capture-pane -t "${session_name}:1.1" -p -S -50 2>/dev/null) || true
 
     if [[ -z "$pane_output" ]]; then
         send_message "$topic_id" "<i>Empty screen</i>"
@@ -751,6 +751,31 @@ cmd_screenshot() {
     send_message "$topic_id" "$msg"
 }
 
+cmd_close() {
+    local topic_id="$1"
+    log "Command: /close"
+
+    if (( topic_id == 0 )); then
+        send_general_message "<i>/close must be used in a session topic</i>"
+        return
+    fi
+
+    local session_name
+    session_name=$(get_session_for_topic "$topic_id")
+    if [[ -z "$session_name" ]]; then
+        send_message "$topic_id" "<i>No session mapped to this topic</i>"
+        return
+    fi
+
+    send_message "$topic_id" "Closing session <code>${session_name}</code>..."
+    stop_watcher "$session_name"
+    tmux kill-session -t "$session_name" 2>/dev/null || true
+    delete_topic "$topic_id" >/dev/null 2>&1 || true
+    local tmp="${STATE_FILE}.tmp"
+    jq --arg s "$session_name" 'del(.topics[$s])' "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+    log "Closed session '$session_name' via /close"
+}
+
 cmd_help() {
     local topic_id="$1"
     local text="<b>Telegram Bridge Commands</b>
@@ -758,15 +783,13 @@ cmd_help() {
 /sessions — List active Claude tmux sessions
 /new [danger|normal] — Launch a new Claude session (default: normal)
 /resume — List recent conversations to resume
+/close — Close the session in this topic
 /approval [yes|no] — Approve or deny a pending permission prompt
 /screenshot — Capture and send the current terminal screen
 /help — Show this help
 
 Messages in a session topic are sent directly to Claude.
 📎 Send files or voice messages directly in a session topic"
-
-    # /kill is built but disabled
-    # /kill N — Kill the Nth session (enable with ENABLE_KILL=true in .env)
 
     if (( topic_id > 0 )); then
         send_message "$topic_id" "$text"
@@ -864,16 +887,69 @@ start_watcher() {
                 local working_file="${CONFIG_DIR}/working_${session_name}"
                 if [[ -f "$working_file" ]]; then
                     # Check if the tmux pane shows the input prompt (❯)
-                    local pane_last_line
-                    pane_last_line=$(tmux capture-pane -t "$session_name" -p 2>/dev/null | grep -v '^\s*$' | tail -5) || true
-                    if echo "$pane_last_line" | grep -q '❯'; then
-                        # Claude is waiting for input — it's done
-                        local w_id
-                        w_id=$(cat "$working_file" 2>/dev/null) || true
+                    local pane_content
+                    pane_content=$(tmux capture-pane -t "${session_name}:1.1" -p 2>/dev/null | grep -v '^\s*$' | tail -10) || true
+                    local has_prompt=false
+                    local has_agents=false
+                    echo "$pane_content" | grep -q '❯' && has_prompt=true
+                    # Check for active teammates (@ indicator in status bar)
+                    echo "$pane_content" | grep -q ' @' && has_agents=true
+
+                    local w_id
+                    w_id=$(cat "$working_file" 2>/dev/null) || true
+
+                    if [[ "$has_prompt" == "true" && "$has_agents" == "false" ]]; then
+                        # Prompt visible, no agents — but wait for cooldown
+                        # Don't fire Done within 15s of last JSONL activity
+                        local activity_file="${CONFIG_DIR}/activity_${session_name}"
+                        local last_activity=0
+                        [[ -f "$activity_file" ]] && last_activity=$(cat "$activity_file" 2>/dev/null) || true
+                        local now_cool
+                        now_cool=$(date +%s)
+                        if (( now_cool - last_activity < 15 )); then
+                            # Too soon — Claude might still be working
+                            continue
+                        fi
+
+                        # Claude is waiting for input with no agents — it's done
                         if [[ -n "$w_id" ]]; then
                             edit_message "$w_id" "✓ Done" "" >/dev/null 2>&1 || true
                         fi
-                        rm -f "$working_file" "${CONFIG_DIR}/activity_${session_name}"
+                        rm -f "$working_file" "${CONFIG_DIR}/activity_${session_name}" "${CONFIG_DIR}/agent_status_${session_name}" "${CONFIG_DIR}/working_dots_${session_name}"
+                    elif [[ -n "$w_id" ]]; then
+                        # Still working — update status with dots and/or agent name
+                        local dots_file="${CONFIG_DIR}/working_dots_${session_name}"
+                        local dot_count
+                        dot_count=$(cat "$dots_file" 2>/dev/null) || dot_count=0
+                        local now_sec
+                        now_sec=$(date +%s)
+                        local last_dot_time
+                        last_dot_time=$(stat -c %Y "$dots_file" 2>/dev/null) || last_dot_time=0
+
+                        # Add a dot every 30 seconds
+                        if (( now_sec - last_dot_time >= 30 )); then
+                            (( dot_count++ )) || true
+                            echo "$dot_count" > "$dots_file"
+                        fi
+
+                        local dot_str=""
+                        for (( d=0; d<dot_count; d++ )); do dot_str+="."; done
+
+                        local status_text="Working...${dot_str}"
+                        if [[ "$has_agents" == "true" ]]; then
+                            local agent_name
+                            agent_name=$(echo "$pane_content" | grep -o ' @[a-zA-Z0-9_-]*' | head -1 | tr -d ' ') || true
+                            [[ -n "$agent_name" ]] && status_text="Working...${dot_str} (${agent_name})"
+                        fi
+
+                        # Only edit if status changed
+                        local prev_status_file="${CONFIG_DIR}/agent_status_${session_name}"
+                        local prev_status
+                        prev_status=$(cat "$prev_status_file" 2>/dev/null) || true
+                        if [[ "$status_text" != "$prev_status" ]]; then
+                            edit_message "$w_id" "$status_text" "" >/dev/null 2>&1 || true
+                            echo "$status_text" > "$prev_status_file"
+                        fi
                     fi
                 fi
                 continue
@@ -1023,18 +1099,7 @@ start_watcher() {
                     if [[ -n "$w_msg_id" ]]; then
                         local working_file="${CONFIG_DIR}/working_${session_name}"
                         echo "$w_msg_id" > "$working_file"
-                        # Background: add dots every 30s
-                        (
-                            local dots=0
-                            while [[ -f "$working_file" ]]; do
-                                sleep 30
-                                [[ -f "$working_file" ]] || break
-                                (( dots++ )) || true
-                                local dot_str=""
-                                for (( d=0; d<dots; d++ )); do dot_str+="."; done
-                                edit_message "$w_msg_id" "Working...${dot_str}" "" >/dev/null 2>&1 || true
-                            done
-                        ) &
+                        # Watcher handles dots and agent status — no background process needed
                     fi
                 fi
 
@@ -1111,7 +1176,7 @@ route_message() {
     echo "$text" > "$last_sent_file"
 
     # Inject message into tmux session
-    tmux send-keys -t "$session_name" -- "$text" Enter
+    tmux send-keys -t "${session_name}:1.1" -- "$text" Enter
 
     # Send delivery confirmation
     send_message "$topic_id" "Message sent ✓" >/dev/null 2>&1 || true
@@ -1125,19 +1190,7 @@ route_message() {
     if [[ -n "$working_msg_id" ]]; then
         local working_file="${CONFIG_DIR}/working_${session_name}"
         echo "$working_msg_id" > "$working_file"
-
-        # Background: add dots every 30s until the watcher clears the file
-        (
-            local dots=0
-            while [[ -f "$working_file" ]]; do
-                sleep 30
-                [[ -f "$working_file" ]] || break
-                (( dots++ )) || true
-                local dot_str=""
-                for (( d=0; d<dots; d++ )); do dot_str+="."; done
-                edit_message "$working_msg_id" "Working...${dot_str}" "" >/dev/null 2>&1 || true
-            done
-        ) &
+        # Watcher handles dots and agent status — no background process needed
     fi
 
     # Ensure watcher is running for this session
@@ -1401,7 +1454,7 @@ handle_file_message() {
         local session_name
         session_name=$(get_session_for_topic "$topic_id")
         if [[ -n "$session_name" ]] && tmux has-session -t "$session_name" 2>/dev/null; then
-            tmux send-keys -t "$session_name" "A file has been uploaded to ${dest} — please read it" Enter
+            tmux send-keys -t "${session_name}:1.1" "A file has been uploaded to ${dest} — please read it" Enter
         fi
     fi
 
@@ -1458,7 +1511,7 @@ handle_voice_transcription() {
             # Record what we sent so the JSONL watcher can skip the echo
             local last_sent_file="${LAST_SENT_DIR}/${session_name}"
             echo "$transcription" > "$last_sent_file"
-            tmux send-keys -t "$session_name" -- "$transcription" Enter
+            tmux send-keys -t "${session_name}:1.1" -- "$transcription" Enter
         fi
     fi
 }
@@ -1602,6 +1655,9 @@ main_loop() {
                         answer=$(echo "$answer" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
                     fi
                     cmd_approval "$topic_id" "$answer"
+                    ;;
+                /close|/close@*)
+                    cmd_close "$topic_id"
                     ;;
                 /screenshot|/screenshot@*)
                     cmd_screenshot "$topic_id"
