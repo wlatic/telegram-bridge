@@ -18,9 +18,9 @@ set -uo pipefail
 CONFIG_DIR="${HOME}/.config/telegram-bridge"
 ENV_FILE="${CONFIG_DIR}/.env"
 STATE_FILE="${CONFIG_DIR}/state.json"
-LOG_DIR="${HOME}/.config/telegram-bridge/logs"
+LOG_DIR="/mnt/zfs/claude/system/logs"
 LOG_FILE="${LOG_DIR}/telegram-bridge.log"
-PROJECT_DIR="${TELEGRAM_BRIDGE_PROJECT_DIR:-${HOME}}"
+PROJECT_DIR="/mnt/zfs/claude/system"
 
 SKIP_SESSIONS="janitor|telegram-bridge|monitor|dev|admin|brain"
 POLL_INTERVAL=2
@@ -64,7 +64,7 @@ GROQ_API_KEY="${GROQ_API_KEY:-}"
 OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 
 API="https://api.telegram.org/bot${BOT_TOKEN}"
-TMP_DIR="${HOME}/tmp"
+TMP_DIR="/home/claude/tmp"
 
 OFFSETS_DIR="${CONFIG_DIR}/offsets"
 WATCHERS_DIR="${CONFIG_DIR}/watchers"
@@ -286,7 +286,7 @@ edit_topic_name() {
 
 # ── Session helpers (adapted from ai/janitor) ─────────────────────────
 
-CONV_DIR="${TELEGRAM_BRIDGE_CONV_DIR:-${HOME}/.claude/projects}"
+CONV_DIR="/home/claude/.claude/projects/-mnt-zfs-claude-system"
 
 # Get conversation ID from a claude process
 get_conv_id_for_session() {
@@ -311,7 +311,7 @@ get_conv_id_for_session() {
     fi
 
     # Fallback: session file
-    local sf="${HOME}/.claude/sessions/${claude_pid}.json"
+    local sf="/home/claude/.claude/sessions/${claude_pid}.json"
     [[ -f "$sf" ]] || return 0
     local sid
     sid=$(python3 -c "import json; print(json.load(open('${sf}'))['sessionId'])" 2>/dev/null) || true
@@ -860,20 +860,20 @@ start_watcher() {
 
             # Nothing new — check if Working... should be cleared (idle 10s)
             if (( current_size <= stored_offset )); then
+                # No new JSONL data — check if Claude is waiting for input
                 local working_file="${CONFIG_DIR}/working_${session_name}"
-                local activity_file="${CONFIG_DIR}/activity_${session_name}"
-                if [[ -f "$working_file" && -f "$activity_file" ]]; then
-                    local last_activity
-                    last_activity=$(cat "$activity_file" 2>/dev/null) || last_activity=0
-                    local now_check
-                    now_check=$(date +%s)
-                    if (( now_check - last_activity >= 30 )); then
+                if [[ -f "$working_file" ]]; then
+                    # Check if the tmux pane shows the input prompt (❯)
+                    local pane_last_line
+                    pane_last_line=$(tmux capture-pane -t "$session_name" -p 2>/dev/null | grep -v '^\s*$' | tail -5) || true
+                    if echo "$pane_last_line" | grep -q '❯'; then
+                        # Claude is waiting for input — it's done
                         local w_id
                         w_id=$(cat "$working_file" 2>/dev/null) || true
                         if [[ -n "$w_id" ]]; then
                             edit_message "$w_id" "✓ Done" "" >/dev/null 2>&1 || true
                         fi
-                        rm -f "$working_file" "$activity_file"
+                        rm -f "$working_file" "${CONFIG_DIR}/activity_${session_name}"
                     fi
                 fi
                 continue
