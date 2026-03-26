@@ -1186,7 +1186,7 @@ start_watcher() {
                             [[ -f "$activity_file" ]] && last_activity=$(cat "$activity_file" 2>/dev/null) || true
                             local now_cool
                             now_cool=$(date +%s)
-                            if (( now_cool - last_activity < 15 )); then
+                            if (( now_cool - last_activity < 30 )); then
                                 continue
                             fi
                             if [[ -n "$w_id" ]]; then
@@ -1203,6 +1203,8 @@ start_watcher() {
                             last_dot_time=$(stat -c %Y "$dots_file" 2>/dev/null) || last_dot_time=0
                             if (( now_sec - last_dot_time >= 30 )); then
                                 (( dot_count++ )) || true
+                                # Cycle 1-3 dots
+                                if (( dot_count > 3 )); then dot_count=1; fi
                                 echo "$dot_count" > "$dots_file"
                             fi
                             local dot_str=""
