@@ -1059,7 +1059,7 @@ start_watcher() {
         fi
 
         while true; do
-            sleep 3
+            sleep 1
 
             # Check session still alive
             if ! tmux has-session -t "$session_name" 2>/dev/null; then
@@ -1508,22 +1508,30 @@ route_message() {
     local last_sent_file="${LAST_SENT_DIR}/${session_name}"
     echo "$text" > "$last_sent_file"
 
-    # Check if Claude is busy (no ❯ prompt = busy, message will be queued)
-    local pane_check
-    pane_check=$(tmux capture-pane -t "${session_name}:1.1" -p 2>/dev/null | grep -v '^\s*$' | tail -5) || true
-    local has_prompt=false
-    local has_agents=false
-    echo "$pane_check" | grep -q '❯' && has_prompt=true
-    echo "$pane_check" | grep -q ' @' && has_agents=true
+    # Check if Claude is busy — JSONL modified in last 10 seconds = busy
+    local is_busy=false
+    local conv_id_check
+    conv_id_check=$(get_conv_id_for_session "$session_name" 2>/dev/null) || true
+    if [[ -n "$conv_id_check" ]]; then
+        local jsonl_file="${CONV_DIR}/${conv_id_check}.jsonl"
+        if [[ -f "$jsonl_file" ]]; then
+            local jsonl_mtime now_check
+            jsonl_mtime=$(stat -c %Y "$jsonl_file" 2>/dev/null) || jsonl_mtime=0
+            now_check=$(date +%s)
+            if (( now_check - jsonl_mtime < 10 )); then
+                is_busy=true
+            fi
+        fi
+    fi
 
     # Inject message into tmux session
     tmux send-keys -t "${session_name}:1.1" -- "$text" Enter
 
     # Send delivery confirmation
-    if [[ "$has_prompt" == "true" && "$has_agents" == "false" ]]; then
-        send_message "$topic_id" "Message sent ✓" >/dev/null 2>&1 || true
-    else
+    if [[ "$is_busy" == "true" ]]; then
         send_message "$topic_id" "📨 Message queued" >/dev/null 2>&1 || true
+    else
+        send_message "$topic_id" "Message sent ✓" >/dev/null 2>&1 || true
     fi
 
     # Clear any existing Working... before creating new one
